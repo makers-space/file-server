@@ -84,17 +84,18 @@ const generateTokens = (user, familyId = null) => {
  * @param {string} refreshToken - JWT refresh token
  */
 const setTokenCookies = (res, accessToken, refreshToken) => {
-    const isProduction = process.env.NODE_ENV === 'production';
-    
     // Parse token expiry times
     const accessTokenExpiry = process.env.ACCESS_TOKEN_EXPIRY;
     const refreshTokenExpiry = process.env.REFRESH_TOKEN_EXPIRY;
     
     // Convert expiry strings to milliseconds
     const parseExpiry = (expiry) => {
+        if (!expiry) return 7 * 24 * 60 * 60 * 1000; // Fallback to 7 days
         const unit = expiry.slice(-1);
         const value = parseInt(expiry.slice(0, -1));
         
+        if (isNaN(value)) return 7 * 24 * 60 * 60 * 1000;
+
         switch(unit) {
             case 'm': return value * 60 * 1000; // minutes
             case 'h': return value * 60 * 60 * 1000; // hours
@@ -106,14 +107,15 @@ const setTokenCookies = (res, accessToken, refreshToken) => {
     const accessTokenMaxAge = parseExpiry(accessTokenExpiry);
     const refreshTokenMaxAge = parseExpiry(refreshTokenExpiry);
     
-    // Cookie settings for cross-origin scenarios:
-    // Development (HTTP): Use 'lax' for same-site, 'none' requires HTTPS
-    // Production (HTTPS): Use 'none' for cross-origin with secure flag
-    // Note: sameSite 'none' REQUIRES secure: true in all modern browsers
+    // Cookie security settings from environment variables
+    // Robust parsing for booleans to handle trailing spaces in .env
+    const isSecure = process.env.COOKIE_SECURE?.trim().toLowerCase() === 'true';
+    const sameSite = process.env.COOKIE_SAMESITE?.trim().toLowerCase() || 'lax';
+
     const cookieOptions = {
         httpOnly: true,
-        secure: isProduction, // Only use secure in production (HTTPS)
-        sameSite: isProduction ? 'none' : 'lax', // 'none' requires HTTPS, use 'lax' for HTTP dev
+        secure: isSecure,
+        sameSite: sameSite,
         path: '/'
     };
     
@@ -142,11 +144,14 @@ const setTokenCookies = (res, accessToken, refreshToken) => {
  * @param {Object} res - Express response object
  */
 const clearTokenCookies = (res) => {
-    const isProduction = process.env.NODE_ENV === 'production';
+    // Use same cookie options as setTokenCookies for proper clearing
+    const isSecure = process.env.COOKIE_SECURE?.trim().toLowerCase() === 'true';
+    const sameSite = process.env.COOKIE_SAMESITE?.trim().toLowerCase() || 'lax';
+
     const cookieOptions = {
         httpOnly: true,
-        secure: isProduction, // Must match how cookies were set
-        sameSite: isProduction ? 'none' : 'lax',
+        secure: isSecure,
+        sameSite: sameSite,
         path: '/'
     };
     
@@ -775,6 +780,14 @@ const authController = {
 
             // Generate new tokens with the SAME family ID (rotation within family)
             const tokens = generateTokens(user, familyId);
+
+            // Renew the token family TTL so the session stays alive as long as the
+            // user keeps rotating (i.e. the 7-day clock resets on each successful refresh
+            // rather than expiring 2 days after first login).
+            if (familyId) {
+                await storeTokenFamily(familyId, user.id);
+            }
+
             await cacheUserSession(user.id, tokens.accessToken); // Cache the new session
 
             // Track user device for token refresh
