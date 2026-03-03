@@ -46,6 +46,25 @@ const REFRESH_TOKEN_FAMILY_PREFIX = 'auth:token_family:';
 const REFRESH_TOKEN_USED_PREFIX = 'auth:refresh_used:';
 
 /**
+ * Derive TTL in seconds from the REFRESH_TOKEN_EXPIRY env var (e.g. "7d", "24h").
+ * Falls back to 7 days (604800s) so the family and used-marker always live at
+ * least as long as the token itself.
+ */
+const getRefreshTokenExpirySeconds = () => {
+    const expiry = process.env.REFRESH_TOKEN_EXPIRY;
+    if (!expiry) return 604800; // 7 days
+    const unit = expiry.slice(-1).toLowerCase();
+    const value = parseInt(expiry.slice(0, -1), 10);
+    if (isNaN(value)) return 604800;
+    switch (unit) {
+        case 'm': return value * 60;
+        case 'h': return value * 60 * 60;
+        case 'd': return value * 24 * 60 * 60;
+        default:  return value; // assume seconds
+    }
+};
+
+/**
  * Generate a unique token family ID for refresh token chains
  * @returns {string} Unique family ID
  */
@@ -59,7 +78,7 @@ const generateTokenFamilyId = () => {
  * @param {string} userId - User ID
  * @param {number} expirySeconds - Expiry time in seconds
  */
-const storeTokenFamily = async (familyId, userId, expirySeconds = 172800) => {
+const storeTokenFamily = async (familyId, userId, expirySeconds = getRefreshTokenExpirySeconds()) => {
     try {
         await cache.set(`${REFRESH_TOKEN_FAMILY_PREFIX}${familyId}`, {
             userId,
@@ -77,7 +96,7 @@ const storeTokenFamily = async (familyId, userId, expirySeconds = 172800) => {
  * @param {string} familyId - Token family ID
  * @param {number} expirySeconds - Expiry time in seconds
  */
-const markRefreshTokenUsed = async (tokenHash, familyId, expirySeconds = 172800) => {
+const markRefreshTokenUsed = async (tokenHash, familyId, expirySeconds = getRefreshTokenExpirySeconds()) => {
     try {
         await cache.set(`${REFRESH_TOKEN_USED_PREFIX}${tokenHash}`, {
             familyId,
@@ -118,7 +137,7 @@ const invalidateTokenFamily = async (familyId) => {
                 ...familyData,
                 isValid: false,
                 invalidatedAt: Date.now()
-            }, 172800); // Keep for 2 days for audit
+            }, getRefreshTokenExpirySeconds()); // Keep for audit for the full token lifetime
             
             logger.warn('[Auth Middleware] Token family invalidated due to potential reuse attack', {
                 familyId,
@@ -589,14 +608,14 @@ const generateCsrfToken = () => {
  * @param {string} token - CSRF token
  */
 const setCsrfCookie = (res, token) => {
-    const isProduction = process.env.NODE_ENV === 'production';
-    // For cross-origin requests in production (HTTPS), use sameSite: 'none' with secure: true
-    // For development (HTTP), use sameSite: 'lax' with secure: false
-    // Note: sameSite 'none' REQUIRES secure: true in all modern browsers
+    const isSecure = process.env.COOKIE_SECURE?.trim().toLowerCase() === 'true';
+    const sameSite = process.env.COOKIE_SAMESITE?.trim().toLowerCase() || 'lax';
+
+    // Use same security settings as authentication cookies
     res.cookie(CSRF_COOKIE_NAME, token, {
         httpOnly: false, // Must be readable by JavaScript to include in header
-        secure: isProduction, // Only use secure in production (HTTPS)
-        sameSite: isProduction ? 'none' : 'lax', // 'none' requires HTTPS, use 'lax' for HTTP dev
+        secure: isSecure,
+        sameSite: sameSite,
         maxAge: CSRF_TOKEN_EXPIRY,
         path: '/'
     });
