@@ -13,6 +13,7 @@ const FILE_EVENTS = {
     FILE_RENAMED: 'file:renamed',
     FILE_MOVED: 'file:moved',
     FILE_UPLOADED: 'file:uploaded',
+    FILE_RESET: 'file:reset',       // Yjs document was atomically reset (delete/re-upload)
     
     // Directory operations
     DIRECTORY_CREATED: 'directory:created',
@@ -58,11 +59,14 @@ const inflate = promisify(zlib.inflate);
 const brotliCompress = promisify(zlib.brotliCompress);
 const brotliDecompress = promisify(zlib.brotliDecompress);
 
-// Compression configuration
+// =============================================================================
+// COMPRESSION CONFIGURATION
+// =============================================================================
+
 const COMPRESSION_CONFIG = {
     // Minimum file size to consider compression (1KB)
-    minSizeForCompression: parseInt(process.env.COMPRESSION_MIN_SIZE),
-    minCompressionRatio: parseFloat(process.env.COMPRESSION_MIN_RATIO),
+    minSizeForCompression: parseInt(process.env.COMPRESSION_MIN_SIZE) || 1024,
+    minCompressionRatio: parseFloat(process.env.COMPRESSION_MIN_RATIO) || 0.05,
 
     // Compression algorithms and their priorities
     algorithms: {
@@ -94,20 +98,20 @@ const COMPRESSION_CONFIG = {
         'application/rss+xml',
         'application/atom+xml',
         'image/svg+xml',
-        'image/bmp',           // Bitmap images (uncompressed)
-        'image/tiff',          // TIFF images (often uncompressed)
-        'image/x-tiff',        // Alternative TIFF MIME type
-        'image/tga',           // Targa images (uncompressed)
-        'image/x-tga',         // Alternative TGA MIME type
-        'image/ppm',           // Portable Pixmap (uncompressed)
-        'image/pgm',           // Portable Graymap (uncompressed)
-        'image/pbm',           // Portable Bitmap (uncompressed)
-        'image/x-portable-anymap', // Generic portable format
-        'model/obj',           // Wavefront OBJ (text-based)
-        'model/gltf+json',     // glTF JSON format
-        'model/vnd.collada+xml', // COLLADA XML format
-        'model/x3d+xml',       // X3D XML format
-        'model/vrml'           // VRML (text-based)
+        'image/bmp',
+        'image/tiff',
+        'image/x-tiff',
+        'image/tga',
+        'image/x-tga',
+        'image/ppm',
+        'image/pgm',
+        'image/pbm',
+        'image/x-portable-anymap',
+        'model/obj',
+        'model/gltf+json',
+        'model/vnd.collada+xml',
+        'model/x3d+xml',
+        'model/vrml'
     ],
 
     // File types that should not be compressed (already compressed)
@@ -117,12 +121,12 @@ const COMPRESSION_CONFIG = {
         'image/png',
         'image/gif',
         'image/webp',
-        'image/avif',          // Modern compressed format
-        'image/heic',          // Apple's compressed format
-        'image/heif',          // High Efficiency Image Format
-        'image/jxl',           // JPEG XL (modern compressed)
-        'image/jp2',           // JPEG 2000
-        'image/jpx',           // JPEG 2000 extended
+        'image/avif',
+        'image/heic',
+        'image/heif',
+        'image/jxl',
+        'image/jp2',
+        'image/jpx',
         'video/',
         'audio/',
         'application/zip',
@@ -134,10 +138,164 @@ const COMPRESSION_CONFIG = {
     ]
 };
 
+// =============================================================================
+// COMPRESSION FUNCTIONS
+// =============================================================================
+
+/**
+ * Determine if a file should be compressed based on type and size
+ */
+const shouldCompressFile = (mimeType, size) => {
+    if (size < COMPRESSION_CONFIG.minSizeForCompression) return false;
+    if (COMPRESSION_CONFIG.nonCompressibleTypes.some(type => mimeType.startsWith(type))) return false;
+    return COMPRESSION_CONFIG.compressibleTypes.some(type => mimeType.startsWith(type));
+};
+
+/**
+ * Compress file buffer using the best available algorithm
+ */
+const compressFileBuffer = async (buffer, mimeType, fileName) => {
+    try {
+        if (!shouldCompressFile(mimeType, buffer.length)) {
+            return {
+                compressed: false,
+                buffer,
+                originalSize: buffer.length,
+                compressedSize: buffer.length,
+                compressionRatio: 1,
+                algorithm: 'none',
+                contentEncoding: null
+            };
+        }
+
+        const originalSize = buffer.length;
+        let bestResult = null;
+        let bestRatio = 1;
+
+        for (const algorithm of ['brotli', 'gzip', 'deflate']) {
+            try {
+                const options = COMPRESSION_CONFIG.options[algorithm];
+                let compressed;
+
+                switch (algorithm) {
+                    case 'brotli':  compressed = await brotliCompress(buffer, options); break;
+                    case 'gzip':    compressed = await gzip(buffer, options); break;
+                    case 'deflate': compressed = await deflate(buffer, options); break;
+                }
+
+                const ratio = compressed.length / originalSize;
+                if (ratio < bestRatio) {
+                    bestRatio = ratio;
+                    bestResult = {
+                        compressed: true,
+                        buffer: compressed,
+                        originalSize,
+                        compressedSize: compressed.length,
+                        compressionRatio: ratio,
+                        algorithm,
+                        contentEncoding: COMPRESSION_CONFIG.algorithms[algorithm].contentEncoding
+                    };
+                }
+            } catch (err) {
+                logger.warn(`Compression failed with ${algorithm}:`, { fileName, error: err.message });
+            }
+        }
+
+        // Only compress if we save at least 5%
+        if (bestRatio > 0.95) {
+            return {
+                compressed: false,
+                buffer,
+                originalSize,
+                compressedSize: originalSize,
+                compressionRatio: 1,
+                algorithm: 'none',
+                contentEncoding: null
+            };
+        }
+
+        logger.info('File compressed successfully', {
+            fileName,
+            algorithm: bestResult.algorithm,
+            originalSize,
+            compressedSize: bestResult.compressedSize,
+            spaceSaved: ((1 - bestRatio) * 100).toFixed(1) + '%'
+        });
+
+        return bestResult;
+    } catch (error) {
+        logger.error('Compression error:', { fileName, error: error.message });
+        return {
+            compressed: false,
+            buffer,
+            originalSize: buffer.length,
+            compressedSize: buffer.length,
+            compressionRatio: 1,
+            algorithm: 'none',
+            contentEncoding: null
+        };
+    }
+};
+
+/**
+ * Decompress file buffer using the specified algorithm
+ */
+const decompressFileBuffer = async (buffer, algorithm, fileName) => {
+    try {
+        if (!algorithm || algorithm === 'none') return buffer;
+
+        if (!Buffer.isBuffer(buffer)) {
+            buffer = typeof buffer === 'string'
+                ? Buffer.from(buffer, 'base64')
+                : Buffer.from(String(buffer), 'base64');
+        }
+
+        switch (algorithm) {
+            case 'brotli':  return await brotliDecompress(buffer);
+            case 'gzip':    return await gunzip(buffer);
+            case 'deflate': return await inflate(buffer);
+            default: throw new Error(`Unsupported compression algorithm: ${algorithm}`);
+        }
+    } catch (error) {
+        logger.error('Decompression error:', { fileName, algorithm, error: error.message });
+        throw new Error(`Failed to decompress file: ${error.message}`);
+    }
+};
+
+/**
+ * Get compression statistics for monitoring
+ */
+const getCompressionStats = (originalSize, compressedSize, algorithm) => {
+    if (typeof originalSize === 'number' && typeof compressedSize === 'number' && algorithm) {
+        const spaceSaved = originalSize - compressedSize;
+        return {
+            originalSize,
+            compressedSize,
+            algorithm,
+            compressionRatio: compressedSize / originalSize,
+            spaceSaved,
+            compressionPercentage: Math.round((spaceSaved / originalSize) * 100)
+        };
+    }
+
+    return {
+        config: {
+            minSizeForCompression: COMPRESSION_CONFIG.minSizeForCompression,
+            algorithms: Object.keys(COMPRESSION_CONFIG.algorithms),
+            compressibleTypes: COMPRESSION_CONFIG.compressibleTypes.length,
+            nonCompressibleTypes: COMPRESSION_CONFIG.nonCompressibleTypes.length
+        },
+        capabilities: {
+            brotli: typeof zlib.brotliCompress === 'function',
+            gzip: typeof zlib.gzip === 'function',
+            deflate: typeof zlib.deflate === 'function'
+        }
+    };
+};
+
 // Configure multer for memory storage
 const storage = multer.memoryStorage();
 
-// Enhanced file filter with compression considerations
 const fileFilter = (req, file, cb) => {
     try {
         // File type blocking can be configured via environment variable
@@ -168,12 +326,11 @@ const fileFilter = (req, file, cb) => {
     }
 };
 
-// Create enhanced multer instance
 const upload = multer({
     storage,
     fileFilter,
     limits: {
-        fileSize: 500 * 1024 * 1024, // 500MB limit (increased for compressed files)
+        fileSize: 500 * 1024 * 1024, // 500MB limit
         files: 20, // Max 20 files at once
         fieldNameSize: 200,
         fieldSize: 10 * 1024 * 1024, // 10MB for non-file fields
@@ -182,202 +339,7 @@ const upload = multer({
 });
 
 /**
- * Determine if a file should be compressed based on type and size
- * @param {string} mimeType - File MIME type
- * @param {number} size - File size in bytes
- * @returns {boolean} - Whether file should be compressed
- */
-const shouldCompressFile = (mimeType, size) => {
-    // Don't compress files smaller than threshold
-    if (size < COMPRESSION_CONFIG.minSizeForCompression) {
-        return false;
-    }
-
-    // Don't compress already compressed formats
-    if (COMPRESSION_CONFIG.nonCompressibleTypes.some(type => mimeType.startsWith(type))) {
-        return false;
-    }
-
-    // Compress compressible types
-    return COMPRESSION_CONFIG.compressibleTypes.some(type => mimeType.startsWith(type));
-};
-
-/**
- * Compress file buffer using the best available algorithm
- * @param {Buffer} buffer - File buffer to compress
- * @param {string} mimeType - File MIME type
- * @param {string} fileName - Original file name
- * @returns {Object} - Compressed data with metadata
- */
-const compressFileBuffer = async (buffer, mimeType, fileName) => {
-    try {
-        if (!shouldCompressFile(mimeType, buffer.length)) {
-            return {
-                compressed: false,
-                buffer: buffer,
-                originalSize: buffer.length,
-                compressedSize: buffer.length,
-                compressionRatio: 1,
-                algorithm: 'none',
-                contentEncoding: null
-            };
-        }
-
-        const originalSize = buffer.length;
-        let bestResult = null;
-        let bestRatio = 1;
-
-        // Try different compression algorithms and pick the best one
-        const algorithms = ['brotli', 'gzip', 'deflate'];
-
-        for (const algorithm of algorithms) {
-            try {
-                let compressed;
-                const options = COMPRESSION_CONFIG.options[algorithm];
-
-                switch (algorithm) {
-                    case 'brotli':
-                        compressed = await brotliCompress(buffer, options);
-                        break;
-                    case 'gzip':
-                        compressed = await gzip(buffer, options);
-                        break;
-                    case 'deflate':
-                        compressed = await deflate(buffer, options);
-                        break;
-                }
-
-                const compressionRatio = compressed.length / originalSize;
-
-                if (compressionRatio < bestRatio) {
-                    bestRatio = compressionRatio;
-                    bestResult = {
-                        compressed: true,
-                        buffer: compressed,
-                        originalSize: originalSize,
-                        compressedSize: compressed.length,
-                        compressionRatio: compressionRatio,
-                        algorithm: algorithm,
-                        contentEncoding: COMPRESSION_CONFIG.algorithms[algorithm].contentEncoding
-                    };
-                }
-
-            } catch (compressionError) {
-                logger.warn(`Failed to compress with ${algorithm}:`, {
-                    fileName,
-                    error: compressionError.message
-                });
-            }
-        }
-
-        // If compression didn't improve size significantly (less than 5% reduction), don't compress
-        if (bestRatio > 0.95) {
-
-            return {
-                compressed: false,
-                buffer: buffer,
-                originalSize: originalSize,
-                compressedSize: originalSize,
-                compressionRatio: 1,
-                algorithm: 'none',
-                contentEncoding: null
-            };
-        }
-
-        logger.info('File compressed successfully', {
-            fileName,
-            algorithm: bestResult.algorithm,
-            originalSize,
-            compressedSize: bestResult.compressedSize,
-            compressionRatio: bestRatio,
-            spaceSaved: ((1 - bestRatio) * 100).toFixed(1) + '%'
-        });
-
-        return bestResult;
-
-    } catch (error) {
-        logger.error('Compression error:', {
-            fileName,
-            error: error.message,
-            stack: error.stack
-        });
-
-        // Return uncompressed data on error
-        return {
-            compressed: false,
-            buffer: buffer,
-            originalSize: buffer.length,
-            compressedSize: buffer.length,
-            compressionRatio: 1,
-            algorithm: 'none',
-            contentEncoding: null,
-            compressionError: error.message
-        };
-    }
-};
-
-/**
- * Decompress file buffer using the specified algorithm
- * @param {Buffer} buffer - Compressed buffer
- * @param {string} algorithm - Compression algorithm used
- * @param {string} fileName - File name for logging
- * @returns {Buffer} - Decompressed buffer
- */
-const decompressFileBuffer = async (buffer, algorithm, fileName) => {
-    try {
-        if (!algorithm || algorithm === 'none') {
-            return buffer;
-        }
-
-        // Ensure we have a proper buffer to decompress
-        if (!Buffer.isBuffer(buffer)) {
-            logger.warn('Non-buffer passed to decompressFileBuffer, converting', {
-                fileName,
-                algorithm,
-                contentType: typeof buffer,
-                length: buffer ? buffer.length : 0
-            });
-
-            // Always assume content is base64 encoded
-            if (typeof buffer === 'string') {
-                buffer = Buffer.from(buffer, 'base64');
-            } else {
-                // For any other type, convert to string and assume it's base64
-                buffer = Buffer.from(String(buffer), 'base64');
-            }
-        }
-
-        let decompressed;
-
-        switch (algorithm) {
-            case 'brotli':
-                decompressed = await brotliDecompress(buffer);
-                break;
-            case 'gzip':
-                decompressed = await gunzip(buffer);
-                break;
-            case 'deflate':
-                decompressed = await inflate(buffer);
-                break;
-            default:
-                throw new Error(`Unsupported compression algorithm: ${algorithm}`);
-        }
-
-        return decompressed;
-
-    } catch (error) {
-        logger.error('Decompression error:', {
-            fileName,
-            algorithm,
-            error: error.message,
-            stack: error.stack
-        });
-        throw new Error(`Failed to decompress file: ${error.message}`);
-    }
-};
-
-/**
- * Enhanced error handling middleware for file operations
+ * Error handling middleware for file operations
  */
 const handleFileErrors = (err, req, res, next) => {
     if (err instanceof multer.MulterError) {
@@ -435,42 +397,6 @@ const handleFileErrors = (err, req, res, next) => {
 
     // Pass other errors to the next error handler
     next(err);
-};
-
-/**
- * Get compression statistics for monitoring
- */
-const getCompressionStats = (originalSize, compressedSize, algorithm) => {
-    // If called with parameters, return individual file statistics
-    if (typeof originalSize === 'number' && typeof compressedSize === 'number' && algorithm) {
-        const compressionRatio = compressedSize / originalSize;
-        const spaceSaved = originalSize - compressedSize;
-        const compressionPercentage = Math.round((spaceSaved / originalSize) * 100);
-
-        return {
-            originalSize,
-            compressedSize,
-            algorithm,
-            compressionRatio,
-            spaceSaved,
-            compressionPercentage
-        };
-    }
-
-    // Otherwise return system configuration statistics
-    return {
-        config: {
-            minSizeForCompression: COMPRESSION_CONFIG.minSizeForCompression,
-            algorithms: Object.keys(COMPRESSION_CONFIG.algorithms),
-            compressibleTypes: COMPRESSION_CONFIG.compressibleTypes.length,
-            nonCompressibleTypes: COMPRESSION_CONFIG.nonCompressibleTypes.length
-        },
-        capabilities: {
-            brotli: typeof zlib.brotliCompress === 'function',
-            gzip: typeof zlib.gzip === 'function',
-            deflate: typeof zlib.deflate === 'function'
-        }
-    };
 };
 
 // =============================================================================
@@ -724,6 +650,8 @@ class YjsService {
         this.redisAdapter = null;
         this.isInitialized = false;
         this.documents = new Map(); // Cache for persistent Yjs documents
+        this.wsDocsMap = null; // Reference to @y/websocket-server's in-memory docs Map
+        this.cancelFns = new Map(); // docName -> fn() that cancels pending persistence timeout
         
         this.config = {
             collectionName: process.env.YJS_COLLECTION_NAME,
@@ -1020,34 +948,234 @@ class YjsService {
 
 
     /**
-     * Create and initialize a Yjs document with content (ONLY for file creation)
-     * This is the standard way to create documents with initial content
+     * Initialize or replace a Yjs document with new content.
+     * Used for file creation (new upload) and file overwrite (re-upload).
+     *
+     * Two paths depending on whether clients are currently connected:
+     *
+     * PATH A — live clients exist:
+     *   Apply the new content as a Yjs transaction directly on the in-memory
+     *   WSSharedDoc. The @y/websocket-server sync protocol broadcasts the delta
+     *   to every connected client immediately, and the existing `update` listener
+     *   (registered in bindState) persists it to MongoDB.  No eviction, no
+     *   auto-reconnect race, no CRDT merge with stale client state.
+     *
+     * PATH B — no live clients:
+     *   Safe to replace MongoDB records directly. Clear the old content, write
+     *   the new content, then clear local caches. When the next client connects
+     *   bindState loads the fresh MongoDB state into a new empty Y.Doc — clean.
+     *
+     * The old "evict then reconnect" approach had an unavoidable race: y-websocket
+     * auto-reconnects synchronously the moment the WS connection closes, so the
+     * client sent its stale state before bindState finished loading the new
+     * MongoDB content, and the CRDT merged them together.
      */
     async initializeTextContent(filePath, initialContent) {
         try {
             const docName = this.getDocumentName(filePath);
-            
-            // Get fresh document from persistence (may already exist if file was restored)
-            const ydoc = await this.persistence.getYDoc(docName);
-            const ytext = ydoc.getText('content');
-            
-            // Initialize with content if provided and document is empty
-            if (initialContent && initialContent.trim() !== '' && ytext.toString().length === 0) {
-                ytext.insert(0, initialContent);
-                
-                // Persist the initial content to database
-                await this.persistence.storeUpdate(docName, Y.encodeStateAsUpdate(ydoc));
+
+            // Always cancel any pending batched persistence writes first so the
+            // 500 ms timer cannot write stale updates after we replace the content.
+            this.cancelPendingUpdates(docName);
+
+            // ── PATH A: live WS clients exist ────────────────────────────────────
+            // If the @y/websocket-server currently holds this doc in memory it means
+            // at least one client is (or was recently) connected. Apply the change
+            // as a transaction on that live doc so clients receive it via sync.
+            if (this.wsDocsMap) {
+                const wsDoc = this.wsDocsMap.get(docName);
+                if (wsDoc) {
+                    wsDoc.transact(() => {
+                        const ytext = wsDoc.getText('content');
+                        ytext.delete(0, ytext.length);
+                        if (initialContent) ytext.insert(0, initialContent);
+                    });
+                    // The update listener registered by bindState will persist this
+                    // transaction to MongoDB within 500 ms. No direct MongoDB write
+                    // needed — and no eviction, so no reconnect race.
+
+                    // Drop our own local cache entry (it's stale relative to wsDoc).
+                    const cachedDoc = this.documents.get(docName);
+                    if (cachedDoc && cachedDoc !== wsDoc) {
+                        cachedDoc.destroy();
+                        this.documents.delete(docName);
+                    }
+
+                    logger.info('Yjs document content replaced via live transaction', {
+                        filePath,
+                        docName,
+                        contentLength: initialContent?.length || 0
+                    });
+                    return;
+                }
             }
-            
-            // Cache the document
-            this.documents.set(docName, ydoc);
-            
+
+            // ── PATH B: no live WS clients — safe MongoDB replacement ─────────────
+
+            // 1a. Destroy local cached doc (prevents stale reads from our cache)
+            const cachedDoc = this.documents.get(docName);
+            if (cachedDoc) {
+                cachedDoc.destroy();
+                this.documents.delete(docName);
+            }
+
+            // 1b. Unbind from Redis adapter if active (for horizontal scaling)
+            if (this.redisAdapter) {
+                try {
+                    await this.redisAdapter.removeAdapter(docName);
+                } catch (redisErr) {
+                    logger.debug('Redis adapter cleanup (non-fatal):', { docName, error: redisErr.message });
+                }
+            }
+
+            // 2a. Delete all Yjs updates from MongoDB using direct Mongoose query
+            if (mongoose.connection.readyState === 1) {
+                try {
+                    const db = mongoose.connection.db;
+                    const yjsCollection = db.collection(this.config.collectionName);
+                    const deleteResult = await yjsCollection.deleteMany({ docName: docName });
+                    logger.debug('Cleared Yjs updates from MongoDB', {
+                        docName,
+                        deletedCount: deleteResult.deletedCount
+                    });
+                } catch (mongoErr) {
+                    logger.warn('Failed to clear Yjs document from MongoDB:', {
+                        filePath,
+                        docName,
+                        error: mongoErr.message
+                    });
+                }
+            }
+
+            // 2b. Also call provider's clearDocument to clear any internal caching
+            if (this.persistence) {
+                try {
+                    await this.persistence.clearDocument(docName);
+                } catch (clearErr) {
+                    logger.debug('Provider clearDocument (non-fatal):', { docName, error: clearErr.message });
+                }
+            }
+
+            // 3. Write the new content to MongoDB
+            if (initialContent && initialContent.trim()) {
+                const ydoc = new Y.Doc();
+                const ytext = ydoc.getText('content');
+                ytext.insert(0, initialContent);
+                await this.persistence.storeUpdate(docName, Y.encodeStateAsUpdate(ydoc));
+                this.documents.set(docName, ydoc);
+            }
+
+            logger.info('Yjs document initialized with content (no live clients)', {
+                filePath,
+                docName,
+                contentLength: initialContent?.length || 0
+            });
         } catch (error) {
             logger.error('Failed to initialize YJS document:', {
                 filePath,
                 error: error.message
             });
             throw error;
+        }
+    }
+
+    /**
+     * Delete a Yjs document — removes from memory cache and MongoDB persistence
+     */
+    async deleteDocument(filePath) {
+        try {
+            const docName = this.getDocumentName(filePath);
+
+            // Cancel any pending batched persistence writes BEFORE touching MongoDB so
+            // the stale 500 ms timer cannot re-write old content after we clear the doc.
+            this.cancelPendingUpdates(docName);
+
+            // Grab the live wsDoc reference before we touch the caches so we can
+            // apply an empty transaction to it in step 3.
+            const wsDoc = this.wsDocsMap?.get(docName) ?? null;
+
+            // 1a. Remove from our own in-memory cache first.
+            //     If the cached entry IS the wsDoc, only remove our pointer — the
+            //     y-websocket server still owns that Y.Doc and it must stay alive so
+            //     we can apply the empty transaction below.
+            const cachedDoc = this.documents.get(docName);
+            if (cachedDoc) {
+                if (cachedDoc !== wsDoc) {
+                    cachedDoc.destroy();
+                }
+                this.documents.delete(docName);
+            }
+
+            // 1b. Unbind from Redis adapter if active
+            if (this.redisAdapter) {
+                try {
+                    await this.redisAdapter.removeAdapter(docName);
+                } catch (redisErr) {
+                    logger.debug('Redis adapter cleanup during delete (non-fatal):', { docName, error: redisErr.message });
+                }
+            }
+
+            // 2. Delete all Yjs updates from MongoDB using direct Mongoose query
+            if (mongoose.connection.readyState === 1) {
+                try {
+                    const db = mongoose.connection.db;
+                    const yjsCollection = db.collection(this.config.collectionName);
+                    const deleteResult = await yjsCollection.deleteMany({ docName: docName });
+                    logger.debug('Deleted Yjs updates from MongoDB', {
+                        docName,
+                        deletedCount: deleteResult.deletedCount
+                    });
+                } catch (mongoErr) {
+                    logger.warn('Failed to delete Yjs document from MongoDB:', {
+                        filePath,
+                        docName,
+                        error: mongoErr.message
+                    });
+                }
+            }
+
+            // 2b. Also call provider's clearDocument to ensure any internal state is cleared
+            if (this.persistence) {
+                try {
+                    await this.persistence.clearDocument(docName);
+                } catch (clearErr) {
+                    logger.debug('Provider clearDocument during delete (non-fatal):', { docName, error: clearErr.message });
+                }
+            }
+
+            // 3. If live WS clients are connected, apply an empty transaction to push
+            //    the "content deleted" state to them immediately.
+            //
+            //    DO NOT evict (close WS connections).  Eviction causes y-websocket to
+            //    auto-reconnect the moment the connection closes; the reconnecting
+            //    browser then sends its stale in-memory Y.Doc state before it receives
+            //    the file:deleted notification, re-populating MongoDB with the old
+            //    content immediately after we just cleared it.  This is the exact race
+            //    documented in initializeTextContent — and the fix is the same:
+            //
+            //      - Apply the content change as a transaction on the live wsDoc.
+            //      - The sync protocol broadcasts the delta to all connected clients.
+            //      - Clients see an empty editor and voluntarily disconnect when the
+            //        file:deleted notification arrives and clearFileSelection() fires.
+            //      - No eviction => no reconnect => no stale-state race.
+            if (wsDoc) {
+                wsDoc.transact(() => {
+                    const ytext = wsDoc.getText('content');
+                    ytext.delete(0, ytext.length);
+                });
+                logger.info('Yjs document content cleared via transaction (delete, no eviction)', {
+                    filePath,
+                    docName
+                });
+            }
+
+            logger.info('Yjs document deleted', { filePath, docName });
+        } catch (error) {
+            logger.error('Failed to delete Yjs document:', {
+                filePath,
+                error: error.message
+            });
+            // Don't throw — deletion should not fail the parent operation
         }
     }
 
@@ -1095,10 +1223,6 @@ class YjsService {
             throw error;
         }
     }
-
-
-
-
 
     /**
      * Move Yjs document from one path to another
@@ -1235,6 +1359,48 @@ class YjsService {
         }
 
         return await this.redisAdapter.healthCheck();
+    }
+
+    /**
+     * Provide the @y/websocket-server `docs` Map so that
+     * deleteDocument / initializeTextContent can also evict the in-memory
+     * WSSharedDoc.  Without this, a deleted-then-reuploaded file would
+     * resurrect stale content from the old in-memory doc.
+     * Call this once after setting up the WebSocket server in server.js.
+     */
+    setWsDocsMap(docsMap) {
+        this.wsDocsMap = docsMap;
+        logger.info('YjsService: WebSocket docs map reference set');
+    }
+
+    /**
+     * Register a cancel function for a document's pending persistence timeout.
+     * Called from server.js bindState so we can abort in-flight batched writes
+     * before clearing / re-seeding the document.
+     */
+    registerCancelFn(docName, fn) {
+        this.cancelFns.set(docName, fn);
+    }
+
+    /**
+     * Remove the cancel function for a document (called after it fires normally).
+     */
+    unregisterCancelFn(docName) {
+        this.cancelFns.delete(docName);
+    }
+
+    /**
+     * Cancel any pending persistence batching for `docName` and clear its
+     * queued updates, so stale data is never written back after a
+     * clearDocument / storeUpdate cycle.
+     */
+    cancelPendingUpdates(docName) {
+        const fn = this.cancelFns.get(docName);
+        if (fn) {
+            fn();
+            this.cancelFns.delete(docName);
+            logger.debug('Cancelled pending persistence timeout', { docName });
+        }
     }
 
     /**
@@ -1565,17 +1731,15 @@ export {
     // Core upload functionality
     upload,
 
-    // Compression/decompression functionality (used by WebSocket operations)
+    // Compression/decompression functionality
     compressFileBuffer,
     decompressFileBuffer,
     shouldCompressFile,
-
-    // Enhanced error handling
-    handleFileErrors,
-
-    // Monitoring and utilities
     getCompressionStats,
     COMPRESSION_CONFIG,
+
+    // Error handling
+    handleFileErrors,
 
     // Yjs collaborative editing functionality
     YjsRedisAdapter,
