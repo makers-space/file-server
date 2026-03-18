@@ -166,26 +166,17 @@ const retrieveFromGridFS = async (filePath, {asStream = false} = {}) => {
 
         const file = files[files.length - 1];
 
-        const compression = file.metadata?.compression || {};
-        const isCompressed = compression.isCompressed === true;
-        const compressionAlgorithm = compression.algorithm;
-
         if (asStream) {
-            // When streaming a compressed file, we need to note the compression
-            // so the download handler can decide whether to stream directly or decompress first
             const downloadStream = bucket.openDownloadStream(file._id);
             return {
                 stream: downloadStream,
                 metadata: file.metadata || {},
                 size: file.length,
-                uploadDate: file.uploadDate,
-                isCompressed,
-                compressionAlgorithm,
-                compressionMetadata: compression
+                uploadDate: file.uploadDate
             };
         }
 
-        // Return content as before for backward compatibility
+        // Collect chunks and return base64-encoded content
         return new Promise((resolve, reject) => {
             const chunks = [];
             const downloadStream = bucket.openDownloadStream(file._id);
@@ -200,26 +191,13 @@ const retrieveFromGridFS = async (filePath, {asStream = false} = {}) => {
                 try {
                     const buffer = Buffer.concat(chunks);
 
-                    // For binary files, return buffer; for text files, convert to string
-                    const mimeType = file.metadata?.mimeType || 'application/octet-stream';
-                    const fileModelModule = await import('../models/file.model.js');
-                    const FileModel = fileModelModule.default ?? fileModelModule.File ?? fileModelModule;
-                    const isTextFile = FileModel.isTextBasedFile(mimeType);
-
-                    const compressionMeta = file.metadata?.compression || {};
-                    const isCompressedFile = compressionMeta.isCompressed === true;
-                    const compressionAlgorithm = compressionMeta.algorithm;
-
                     const content = buffer.toString('base64');
 
                     resolve({
                         content, // Always base64 encoded
                         metadata: file.metadata || {},
                         size: file.length,
-                        uploadDate: file.uploadDate,
-                        isCompressed: isCompressedFile,
-                        compressionAlgorithm,
-                        compressionMetadata: compressionMeta
+                        uploadDate: file.uploadDate
                     });
                 } catch (innerError) {
                     reject(innerError);

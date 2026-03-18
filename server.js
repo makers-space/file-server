@@ -450,6 +450,8 @@ class Server {
                                                     }
                                                     pendingPersistenceUpdates.clear();
                                                     persistenceTimeout = null;
+                                                    // Unregister cancel fn once it has fired naturally
+                                                    if (yjsService?.unregisterCancelFn) yjsService.unregisterCancelFn(docName);
                                                 }, 500); // 500ms batching for persistence
                                                 
                                                 // Debounce File model updates to avoid performance issues (longer delay)
@@ -470,8 +472,9 @@ class Server {
                                                                 '/' + docNameToUpdate; // Add leading slash if no prefix
                                                             
                                                             // Update the file metadata to reflect the content change
+                                                            // Match both text files and binary files that use Yjs (e.g. DOCX)
                                                             await FileModel.updateOne(
-                                                                { filePath: filePath, type: 'text' },
+                                                                { filePath: filePath, type: { $in: ['text', 'binary'] } },
                                                                 { updatedAt: new Date() }
                                                             );
                                                             
@@ -497,6 +500,20 @@ class Server {
                                                 });
                                             }
                                         });
+
+                                        // Register a cancel function so YjsService can abort the pending
+                                        // 500 ms persistence batch before clearing / re-seeding a document.
+                                        // Without this, stale updates would be written back to MongoDB
+                                        // AFTER clearDocument + storeUpdate(fresh) have already run.
+                                        if (yjsService?.registerCancelFn) {
+                                            yjsService.registerCancelFn(docName, () => {
+                                                if (persistenceTimeout) {
+                                                    clearTimeout(persistenceTimeout);
+                                                    persistenceTimeout = null;
+                                                }
+                                                pendingPersistenceUpdates.delete(docName);
+                                            });
+                                        }
 
                                         // Bind Redis adapter for cross-server synchronization
                                         try {
@@ -578,14 +595,26 @@ class Server {
                                 // Authenticate WebSocket connection
                                 const user = await authMiddleware.authenticateWebSocket?.(ws, req);
 
-                                // Extract document name from URL
-                                const docNameFromUrl = req.url.slice(1).split('?')[0];
+                                // Extract document name from URL.
+                                // CRITICAL: URL-decode the path so the docs-map key matches
+                                // the names produced by yjsService.getDocumentName().
+                                // Without this, filenames containing spaces or special chars
+                                // (e.g. "resume for AYODEJI (updated).docx") end up stored
+                                // under the percent-encoded key in the docs map, while
+                                // initializeTextContent / deleteDocument look up the
+                                // non-encoded key — causing stale-content mismatches.
+                                const docNameFromUrl = decodeURIComponent(
+                                    req.url.slice(1).split('?')[0]
+                                );
                                 
                                 // Call setupWSConnection which handles the Yjs sync protocol  
                                 // This will create or retrieve the Y.Doc from the docs cache
                                 // gc: false prevents aggressive garbage collection that might
                                 // cause documents to be prematurely removed from memory
+                                // Pass the decoded docName explicitly so every layer uses
+                                // the same un-encoded key (docs map, MongoDB, yjsService).
                                 setupWSConnection(ws, req, {
+                                    docName: docNameFromUrl,
                                     gc: false  // Keep documents in memory for better collaboration
                                 });
 
@@ -636,6 +665,13 @@ class Server {
                         
                         // Store WebSocket server reference for shutdown
                         this.yjsWebSocketServer = wss;
+
+                        // Give YjsService a reference to the WS server's in-memory
+                        // docs Map so that deleteDocument / initializeTextContent can
+                        // evict stale documents and force a fresh bindState on reconnect.
+                        if (yjsService?.setWsDocsMap) {
+                            yjsService.setWsDocsMap(docs);
+                        }
                         
                         logger.info('✅ Integrated Yjs WebSocket server running on /yjs path');
                         

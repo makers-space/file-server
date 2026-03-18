@@ -4,29 +4,42 @@ import logger from '../utils/app.logger.js';
 import {storeInGridFS, retrieveFromGridFS, deleteFromGridFS} from '../config/db.js';
 
 /**
- * Binary file extensions - single source of truth
- * Used for file type classification throughout the application
+ * Binary file extensions — single source of truth.
+ * Any file whose extension is in this list is stored in GridFS (type: 'binary').
+ * Everything else is type: 'text' and uses Yjs collaborative persistence.
+ *
+ * Notable intentional omissions (these are type: 'text'):
+ *   • docx / doc  — Word documents;  HTML representation stored in Yjs, TipTap editor
+ *   • All source-code extensions — raw text stored in Yjs, Monaco editor
+ *   • Markdown / plain-text files  — stored in Yjs, MDXEditor
  */
 const BINARY_FILE_EXTENSIONS = [
-    // Images
-    'jpg', 'jpeg', 'png', 'gif', 'webp', 'svg', 'bmp', 'ico', 'tiff',
-    // Audio
+    // ── Raster images ─────────────────────────────────────────────────────────
+    'jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp', 'ico', 'tiff', 'tif',
+    // ── Vector / structured images (treated as binary blobs here) ─────────────
+    'svg',
+    // ── Audio ─────────────────────────────────────────────────────────────────
     'mp3', 'wav', 'flac', 'aac', 'ogg', 'm4a', 'wma',
-    // Video
+    // ── Video ─────────────────────────────────────────────────────────────────
     'mp4', 'webm', 'avi', 'mov', 'wmv', 'flv', 'mkv', 'm4v',
-    // Documents
-    'pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx',
-    // Archives
-    'zip', 'rar', '7z', 'tar', 'gz', 'bz2',
-    // Executables
-    'exe', 'dll', 'bin', 'dmg', 'iso',
-    // Databases
-    'db', 'sqlite', 'mdb',
-    // Design
-    'psd', 'ai', 'indd', 'sketch', 'fig',
-    // 3D Models
+    // ── Non-editable office / document formats ────────────────────────────────
+    // (docx/doc are intentionally absent — they use the Yjs text pipeline)
+    'pdf', 'xls', 'xlsx', 'ppt', 'pptx', 'odt', 'ods', 'odp',
+    // ── Archives ──────────────────────────────────────────────────────────────
+    'zip', 'rar', '7z', 'tar', 'gz', 'bz2', 'xz', 'zst',
+    // ── Executables & system binaries ─────────────────────────────────────────
+    'exe', 'dll', 'so', 'dylib', 'bin', 'dmg', 'iso', 'img', 'pkg', 'deb', 'rpm',
+    // ── Compiled / bytecode ───────────────────────────────────────────────────
+    'class', 'pyc', 'pyo', 'o', 'a', 'lib',
+    // ── Database files ────────────────────────────────────────────────────────
+    'db', 'sqlite', 'sqlite3', 'mdb', 'accdb',
+    // ── Design & creative tools ───────────────────────────────────────────────
+    'psd', 'psb', 'ai', 'indd', 'sketch', 'fig', 'xd', 'afdesign',
+    // ── 3-D models ────────────────────────────────────────────────────────────
     'obj', 'gltf', 'glb', 'fbx', 'stl', 'dae', '3ds', 'blend',
-    'ply', '3mf', 'usdz', 'usda', 'usdc', 'vrm', 'vox', 'c4d'
+    'ply', '3mf', 'usdz', 'usda', 'usdc', 'vrm', 'vox', 'c4d',
+    // ── Fonts ─────────────────────────────────────────────────────────────────
+    'ttf', 'otf', 'woff', 'woff2', 'eot',
 ];
 
 /**
@@ -166,36 +179,6 @@ const fileSchema = new mongoose.Schema({
         }
     },
 
-    // Compression information for binary files
-    compression: {
-        isCompressed: {
-            type: Boolean,
-            default: false,
-            index: true // Index for aggregation performance
-        },
-        algorithm: {
-            type: String,
-            enum: ['none', 'gzip', 'deflate', 'brotli'],
-            default: 'none'
-        },
-        originalSize: {
-            type: Number,
-            default: 0,
-            min: [0, 'Original size cannot be negative']
-        },
-        compressionRatio: {
-            type: Number,
-            default: 1,
-            min: [0, 'Compression ratio cannot be negative'],
-            max: [1, 'Compression ratio cannot exceed 1']
-        },
-        contentEncoding: {
-            type: String,
-            enum: ['gzip', 'deflate', 'br', null],
-            default: null
-        }
-    },
-
     // Media metadata for audio/video files
     mediaMetadata: {
         // Common fields (audio & video)
@@ -226,6 +209,18 @@ const fileSchema = new mongoose.Schema({
     // Version snapshots for binary files only
     // Collaborative files use Yjs built-in versioning
     // Versions are ordered oldest-first (index 0 = version 1, index 1 = version 2, etc.)
+    // Compression metadata for binary files stored in GridFS
+    compression: {
+        isCompressed: { type: Boolean, default: false },
+        algorithm: { type: String, enum: ['none', 'brotli', 'gzip', 'deflate'], default: 'none' },
+        originalSize: { type: Number, default: 0 },
+        compressionRatio: { type: Number, default: 1 },
+        contentEncoding: { type: String, default: null }
+    },
+
+    // Version snapshots for binary files only
+    // Collaborative files use Yjs built-in versioning
+    // Versions are ordered oldest-first (index 0 = version 1, index 1 = version 2, etc.)
     versionHistory: [{
         timestamp: {type: Date, default: Date.now},
         modifiedBy: {type: mongoose.Schema.Types.ObjectId, ref: 'User'},
@@ -249,10 +244,10 @@ fileSchema.index({parentPath: 1, owner: 1});
 fileSchema.index({type: 1, owner: 1});
 fileSchema.index({depth: 1, owner: 1});
 
-// Compression aggregation indexes
+// Compression indexes (for stats aggregation)
 fileSchema.index({'compression.isCompressed': 1, type: 1});
-fileSchema.index({'compression.algorithm': 1, 'compression.isCompressed': 1});
-fileSchema.index({type: 1, 'compression.isCompressed': 1, owner: 1});
+fileSchema.index({'compression.algorithm': 1});
+fileSchema.index({'compression.originalSize': 1, 'size': 1});
 
 // Text search index
 fileSchema.index({fileName: 'text', filePath: 'text'});
@@ -287,13 +282,13 @@ fileSchema.pre('save', async function(next) {
     if (this.content && typeof this.content === 'string') {
         this.size = Buffer.byteLength(this.content, 'utf8');
     }
-    
-    // Ensure compression fields exist for all file types (not directories)
-    if (this.type !== 'directory' && !this.compression) {
+
+    // Initialize compression defaults for new files
+    if (this.isNew && !this.compression) {
         this.compression = {
             isCompressed: false,
             algorithm: 'none',
-            originalSize: this.size || 0,
+            originalSize: 0,
             compressionRatio: 1,
             contentEncoding: null
         };
@@ -321,7 +316,8 @@ fileSchema.statics.getSupportedTypes = function() {
                         'html', 'css', 'scss', 'sass', 'less', 'yaml', 'yml', 
                         'sql', 'py', 'java', 'c', 'cpp', 'h', 'go', 'rs', 'php',
                         'rb', 'sh', 'bat', 'ps1', 'dockerfile', 'gitignore',
-                        'ini', 'conf', 'config', 'env', 'log'],
+                        'ini', 'conf', 'config', 'env', 'log',
+                        'doc', 'docx'],
             description: 'Text files stored as Yjs collaborative documents'
         },
         binary: {
@@ -348,6 +344,8 @@ fileSchema.statics.getMimeType = function(extension) {
         'xml': 'application/xml',
         'yaml': 'application/yaml',
         'yml': 'application/yaml',
+        'doc': 'application/msword',
+        'docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
         // Images - compressed formats
         'jpg': 'image/jpeg',
         'jpeg': 'image/jpeg',
@@ -357,7 +355,7 @@ fileSchema.statics.getMimeType = function(extension) {
         'avif': 'image/avif',
         'heic': 'image/heic',
         'heif': 'image/heif',
-        // Images - uncompressed formats (will benefit from compression)
+        // Images - uncompressed formats
         'bmp': 'image/bmp',
         'tiff': 'image/tiff',
         'tif': 'image/tiff',
@@ -460,7 +458,7 @@ fileSchema.methods.getContent = async function() {
 };
 
 // Instance method to set content (binary files only - text files use Yjs persistence)
-fileSchema.methods.setContent = async function(newContent, session = null, compressionOptions = null) {
+fileSchema.methods.setContent = async function(newContent, compressionOptions = null, session = null) {
     if (this.type === 'text') {
         throw new Error('Text files use Yjs persistence. Use Yjs document to set content.');
     }
@@ -499,24 +497,15 @@ fileSchema.methods.setContent = async function(newContent, session = null, compr
     
     this.size = contentSize;
     this.lastModifiedBy = this.lastModifiedBy || this.owner;
-    
-    // Set compression info if provided
+
+    // Store compression metadata if provided
     if (compressionOptions) {
         this.compression = {
-            isCompressed: compressionOptions.isCompressed || false,
+            isCompressed: compressionOptions.compressed || false,
             algorithm: compressionOptions.algorithm || 'none',
             originalSize: compressionOptions.originalSize || contentSize,
             compressionRatio: compressionOptions.compressionRatio || 1,
             contentEncoding: compressionOptions.contentEncoding || null
-        };
-    } else {
-        // Ensure compression fields exist for statistics
-        this.compression = {
-            isCompressed: false,
-            algorithm: 'none',
-            originalSize: contentSize,
-            compressionRatio: 1,
-            contentEncoding: null
         };
     }
     

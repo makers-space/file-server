@@ -447,20 +447,17 @@ const clearCache = (patterns = []) => {
     return async (req, res, next) => {
         const originalJson = res.json;
 
-        res.json = async function (body) {
-            try {
-                // Only clear cache for successful responses (2xx status codes) and if caching is enabled
-                if (res.statusCode >= 200 && res.statusCode < 300 && cache.isEnabled()) {
-                    let patternsToUse = patterns;
+        res.json = function (body) {
+            // Send the response immediately — never delay the client for cache housekeeping.
+            const result = originalJson.call(this, body);
 
-                    // If patterns is a function, call it with request object
-                    if (typeof patternsToUse === 'function') {
-                        patternsToUse = patternsToUse(req, body);
-                    }
-                    if (Array.isArray(patternsToUse) && patternsToUse.length > 0) {
+            // Fire-and-forget cache clearing after response is already sent.
+            if (res.statusCode >= 200 && res.statusCode < 300 && cache.isEnabled()) {
+                let patternsToUse = typeof patterns === 'function' ? patterns(req, body) : patterns;
+                if (Array.isArray(patternsToUse) && patternsToUse.length > 0) {
+                    (async () => {
                         for (const pattern of patternsToUse) {
                             try {
-                                // Use delPattern for wildcard patterns, del for exact keys
                                 if (pattern.includes('*')) {
                                     await cache.delPattern(pattern);
                                     logger.info(`${logger.safeColor(logger.colors.cyan)}[Cache Middleware]${logger.safeColor(logger.colors.reset)} Cleared cache for pattern: ${pattern}`);
@@ -472,13 +469,11 @@ const clearCache = (patterns = []) => {
                                 logger.error(`${logger.safeColor(logger.colors.red)}[Cache Middleware]${logger.safeColor(logger.colors.reset)} Error clearing cache for pattern ${pattern}:`, err);
                             }
                         }
-                    }
+                    })();
                 }
-            } catch (err) {
-                logger.error(`${logger.safeColor(logger.colors.red)}[Cache Middleware]${logger.safeColor(logger.colors.reset)} Error clearing cache:`, err);
             }
 
-            return originalJson.call(this, body);
+            return result;
         };
 
         next();

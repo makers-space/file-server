@@ -4,16 +4,11 @@ import {AppError} from '../middleware/error.middleware.js';
 import {hasRight, RIGHTS} from '../config/rights.js';
 import {cache} from '../middleware/cache.middleware.js';
 import logger from '../utils/app.logger.js';
-import {sanitizeHtmlInObject} from '../utils/sanitize.js';
-import crypto from 'node:crypto';
 import mongoose from 'mongoose';
 import path from 'node:path';
 import fs from 'node:fs';
 import {parseFilters} from './app.controller.js';
 import {
-    getCompressionStats,
-    compressFileBuffer,
-    decompressFileBuffer,
     getYjsService,
     getFileNotificationService,
     FILE_EVENTS
@@ -22,6 +17,280 @@ import {renameInGridFS, getGridFSBucket, storeInGridFS, retrieveFromGridFS} from
 import {parseBuffer} from 'music-metadata';
 import ffmpeg from 'fluent-ffmpeg';
 import sharp from 'sharp';
+import JSZip from 'jszip';
+
+// =============================================================================
+// DOCX → HTML CONVERTER
+// =============================================================================
+
+const emuToPx = (emu) => Math.round((Number(emu) / 914400) * 96);
+const twipsToPx = (tw) => Math.round((Number(tw) / 1440) * 96);
+const hpToPt = (hp) => Number(hp) / 2;
+const line240 = (v) => (Number(v) / 240).toFixed(2);
+const ooxmlColor = (c) => c && c !== 'auto' && /^[0-9A-Fa-f]{6}$/.test(c) ? `#${c}` : null;
+
+const inner = (xml, tag) => {
+    const m = xml.match(new RegExp(`<${tag}[\\s>]([\\s\\S]*?)<\\/${tag}>`));
+    return m ? m[1] : '';
+};
+
+const wVal = (xml, tag, attr = 'w:val') => {
+    const m = xml.match(new RegExp(`<${tag}\\s+[^>]*?${attr}="([^"]+)"`));
+    return m ? m[1] : null;
+};
+
+const hasTag = (xml, tag) => new RegExp(`<${tag}[\\s/>]`).test(xml);
+
+function escapeHtml(str) {
+    return str
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;');
+}
+
+async function loadRelationships(zip) {
+    const relsXml = await zip.file('word/_rels/document.xml.rels')?.async('string');
+    if (!relsXml) return {};
+    const map = {};
+    const re = /<Relationship\s+[^>]*?Id="([^"]+)"[^>]*?Target="([^"]+)"/g;
+    let m;
+    while ((m = re.exec(relsXml)) !== null) map[m[1]] = m[2];
+    return map;
+}
+
+async function loadStyleMap(zip) {
+    const stylesXml = await zip.file('word/styles.xml')?.async('string');
+    if (!stylesXml) return {};
+    const styleMap = {};
+    const styleRegex = /<w:style\s+[^>]*?w:styleId="([^"]+)"[^>]*?>([\s\S]*?)<\/w:style>/g;
+    let sm;
+    while ((sm = styleRegex.exec(stylesXml)) !== null) {
+        const id = sm[1];
+        const body = sm[2];
+        styleMap[id] = { pPr: inner(body, 'w:pPr'), rPr: inner(body, 'w:rPr'), basedOn: wVal(body, 'w:basedOn') };
+    }
+    return styleMap;
+}
+
+function resolveStyle(which, styleId, styleMap, visited = new Set()) {
+    if (!styleId || !styleMap[styleId] || visited.has(styleId)) return '';
+    visited.add(styleId);
+    const s = styleMap[styleId];
+    return resolveStyle(which, s.basedOn, styleMap, visited) + s[which];
+}
+const resolveStylePPr = (id, m) => resolveStyle('pPr', id, m);
+const resolveStyleRPr = (id, m) => resolveStyle('rPr', id, m);
+
+function parseParagraphStyles(pPr, styleMap) {
+    const styles = [];
+    const pStyleId = wVal(pPr, 'w:pStyle') || 'Normal';
+    const resolvedPPr = resolveStylePPr(pStyleId, styleMap) + pPr;
+    const jc = wVal(resolvedPPr, 'w:jc');
+    if (jc && jc !== 'left') styles.push(`text-align: ${jc === 'both' ? 'justify' : jc}`);
+    const indBlock = resolvedPPr.match(/<w:ind\s+([^/>]*)\/?>/)?.[1] || '';
+    if (indBlock) {
+        const l = indBlock.match(/w:left="(\d+)"/);
+        const r = indBlock.match(/w:right="(\d+)"/);
+        const f = indBlock.match(/w:firstLine="(\d+)"/);
+        const h = indBlock.match(/w:hanging="(\d+)"/);
+        if (l) styles.push(`margin-left: ${twipsToPx(l[1])}px`);
+        if (r) styles.push(`margin-right: ${twipsToPx(r[1])}px`);
+        if (f) styles.push(`text-indent: ${twipsToPx(f[1])}px`);
+        if (h) styles.push(`text-indent: -${twipsToPx(h[1])}px`);
+    }
+    const spBlock = resolvedPPr.match(/<w:spacing\s+([^/>]*)\/?>/)?.[1] || '';
+    {
+        const b = spBlock.match(/w:before="(\d+)"/);
+        const a = spBlock.match(/w:after="(\d+)"/);
+        const ln = spBlock.match(/w:line="(\d+)"/);
+        const lr = spBlock.match(/w:lineRule="([^"]+)"/);
+        styles.push(`margin-top: ${b ? twipsToPx(b[1]) : 0}px`);
+        styles.push(`margin-bottom: ${a ? twipsToPx(a[1]) : 0}px`);
+        if (ln) {
+            const rule = lr ? lr[1] : 'auto';
+            styles.push(`line-height: ${rule === 'auto' ? line240(ln[1]) : twipsToPx(ln[1]) + 'px'}`);
+        } else {
+            styles.push('line-height: 1.15');
+        }
+    }
+    const rPr = inner(resolvedPPr, 'w:rPr');
+    if (rPr) {
+        const sz = wVal(rPr, 'w:sz');
+        const ff = wVal(rPr, 'w:rFonts', 'w:ascii');
+        if (sz) styles.push(`font-size: ${hpToPt(sz)}pt`);
+        if (ff) styles.push(`font-family: '${ff}'`);
+    }
+    return { styles, pStyleId };
+}
+
+function parseRunStyles(rPr, styleMap, pStyleId) {
+    const styles = [];
+    const tags = { open: '', close: '' };
+    if (!rPr && !pStyleId) return { styles, tags };
+    const rStyleId = wVal(rPr || '', 'w:rStyle');
+    const styleRPr = resolveStyleRPr(rStyleId, styleMap) + resolveStyleRPr(pStyleId, styleMap);
+    const mergedRPr = styleRPr + (rPr || '');
+    if (hasTag(mergedRPr, 'w:b') && wVal(mergedRPr, 'w:b') !== '0' && wVal(mergedRPr, 'w:b') !== 'false')
+        { tags.open += '<strong>'; tags.close = '</strong>' + tags.close; }
+    if (hasTag(mergedRPr, 'w:i') && wVal(mergedRPr, 'w:i') !== '0' && wVal(mergedRPr, 'w:i') !== 'false')
+        { tags.open += '<em>'; tags.close = '</em>' + tags.close; }
+    const uVal = wVal(mergedRPr, 'w:u');
+    if (uVal && uVal !== 'none') { tags.open += '<u>'; tags.close = '</u>' + tags.close; }
+    if (hasTag(mergedRPr, 'w:strike') && wVal(mergedRPr, 'w:strike') !== '0' && wVal(mergedRPr, 'w:strike') !== 'false')
+        { tags.open += '<s>'; tags.close = '</s>' + tags.close; }
+    const finalRPr = rPr || '';
+    const sz = wVal(finalRPr, 'w:sz') || wVal(styleRPr, 'w:sz');
+    const ff = wVal(finalRPr, 'w:rFonts', 'w:ascii') || wVal(styleRPr, 'w:rFonts', 'w:ascii');
+    const col = wVal(finalRPr, 'w:color') || wVal(styleRPr, 'w:color');
+    const hl = wVal(finalRPr, 'w:highlight') || wVal(styleRPr, 'w:highlight');
+    if (sz) styles.push(`font-size: ${hpToPt(sz)}pt`);
+    if (ff) styles.push(`font-family: '${ff}'`);
+    const cssCol = ooxmlColor(col);
+    if (cssCol) styles.push(`color: ${cssCol}`);
+    if (hl && hl !== 'none') {
+        const hlMap = {
+            yellow: '#ffff00', green: '#00ff00', cyan: '#00ffff', magenta: '#ff00ff',
+            blue: '#0000ff', red: '#ff0000', darkBlue: '#000080', darkCyan: '#008080',
+            darkGreen: '#008000', darkMagenta: '#800080', darkRed: '#800000',
+            darkYellow: '#808000', darkGray: '#808080', lightGray: '#c0c0c0',
+            black: '#000000', white: '#ffffff',
+        };
+        styles.push(`background-color: ${hlMap[hl] || '#ffff00'}`);
+    }
+    return { styles, tags };
+}
+
+async function extractImage(drawingXml, zip, rels) {
+    const extMatch = drawingXml.match(/<wp:extent\s+cx="(\d+)"\s+cy="(\d+)"/);
+    const widthPx = extMatch ? emuToPx(extMatch[1]) : null;
+    const heightPx = extMatch ? emuToPx(extMatch[2]) : null;
+    const embedMatch = drawingXml.match(/r:embed="([^"]+)"/);
+    if (!embedMatch) return null;
+    const target = rels[embedMatch[1]];
+    if (!target) return null;
+    const imgPath = target.startsWith('/') ? target.slice(1) : `word/${target}`;
+    const imgFile = zip.file(imgPath);
+    if (!imgFile) return null;
+    const imgData = await imgFile.async('base64');
+    const ext = imgPath.split('.').pop().toLowerCase();
+    const ctMap = {
+        png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg',
+        gif: 'image/gif', bmp: 'image/bmp', svg: 'image/svg+xml',
+        webp: 'image/webp', tiff: 'image/tiff', tif: 'image/tiff',
+        emf: 'image/x-emf', wmf: 'image/x-wmf',
+    };
+    const ct = ctMap[ext] || 'image/png';
+    let attrs = `src="data:${ct};base64,${imgData}"`;
+    if (widthPx) attrs += ` width="${widthPx}"`;
+    if (heightPx) attrs += ` height="${heightPx}"`;
+    if (widthPx && heightPx) attrs += ` style="width: ${widthPx}px; height: ${heightPx}px"`;
+    return `<img ${attrs} />`;
+}
+
+async function processRun(runXml, zip, rels, styleMap, pStyleId) {
+    const rPr = inner(runXml, 'w:rPr');
+    const { styles, tags } = parseRunStyles(rPr, styleMap, pStyleId);
+    const rInner = runXml.replace(/^<w:r[^>]*>/, '').replace(/<\/w:r>$/, '');
+    const pieceRegex = /(<w:t[\s>][\s\S]*?<\/w:t>|<w:br\s*\/?>|<w:tab\s*\/?>|<w:cr\s*\/?>|<w:drawing>[\s\S]*?<\/w:drawing>)/g;
+    let html = '', pm;
+    while ((pm = pieceRegex.exec(rInner)) !== null) {
+        const piece = pm[1];
+        if (piece.startsWith('<w:t'))
+            html += escapeHtml(piece.replace(/<w:t[^>]*>/, '').replace(/<\/w:t>/, ''));
+        else if (piece.startsWith('<w:br') || piece.startsWith('<w:cr'))
+            html += '<br />';
+        else if (piece.startsWith('<w:tab'))
+            html += '<span style="display: inline-block; min-width: 48px">\u00a0</span>';
+        else if (piece.startsWith('<w:drawing')) {
+            const imgHtml = await extractImage(piece, zip, rels);
+            if (imgHtml) html += imgHtml;
+        }
+    }
+    if (!html) return '';
+    let result = styles.length ? `<span style="${styles.join('; ')}">${html}</span>` : html;
+    return tags.open + result + tags.close;
+}
+
+async function processParagraph(pXml, zip, rels, styleMap) {
+    const pPr = inner(pXml, 'w:pPr');
+    const { styles: pStyles, pStyleId } = parseParagraphStyles(pPr, styleMap);
+    const elemRegex = /(<w:hyperlink[\s>][\s\S]*?<\/w:hyperlink>|<w:r[\s>][\s\S]*?<\/w:r>)/g;
+    let content = '', em;
+    while ((em = elemRegex.exec(pXml)) !== null) {
+        const elem = em[1];
+        if (elem.startsWith('<w:hyperlink')) {
+            const rIdMatch = elem.match(/r:id="([^"]+)"/);
+            const href = rIdMatch && rels[rIdMatch[1]] ? rels[rIdMatch[1]] : '#';
+            const innerRunRegex = /<w:r[\s>][\s\S]*?<\/w:r>/g;
+            let irm, linkContent = '';
+            while ((irm = innerRunRegex.exec(elem)) !== null)
+                linkContent += await processRun(irm[0], zip, rels, styleMap, pStyleId);
+            if (linkContent)
+                content += `<a href="${escapeHtml(href)}" target="_blank" rel="noopener noreferrer">${linkContent}</a>`;
+        } else {
+            content += await processRun(elem, zip, rels, styleMap, pStyleId);
+        }
+    }
+    let tag = 'p';
+    if (/^heading\s*1$/i.test(pStyleId))      tag = 'h1';
+    else if (/^heading\s*2$/i.test(pStyleId)) tag = 'h2';
+    else if (/^heading\s*3$/i.test(pStyleId)) tag = 'h3';
+    else if (/^heading\s*4$/i.test(pStyleId)) tag = 'h4';
+    else if (/^heading\s*5$/i.test(pStyleId)) tag = 'h5';
+    else if (/^heading\s*6$/i.test(pStyleId)) tag = 'h6';
+    else if (/^title$/i.test(pStyleId))       tag = 'h1';
+    else if (/^subtitle$/i.test(pStyleId))    tag = 'h2';
+    const styleAttr = pStyles.length ? ` style="${pStyles.join('; ')}"` : '';
+    return `<${tag}${styleAttr}>${content || '<br />'}</${tag}>`;
+}
+
+async function processTable(tblXml, zip, rels, styleMap) {
+    let html = '<table style="border-collapse: collapse; width: 100%">';
+    const rowRegex = /<w:tr[\s>][\s\S]*?<\/w:tr>/g;
+    const cellRegex = /<w:tc[\s>][\s\S]*?<\/w:tc>/g;
+    const cellPRegex = /<w:p[\s>][\s\S]*?<\/w:p>/g;
+    let rm;
+    while ((rm = rowRegex.exec(tblXml)) !== null) {
+        html += '<tr>';
+        cellRegex.lastIndex = 0;
+        let cm;
+        while ((cm = cellRegex.exec(rm[0])) !== null) {
+            html += '<td style="border: 1px solid #ccc; padding: 4px 8px">';
+            cellPRegex.lastIndex = 0;
+            let pm;
+            while ((pm = cellPRegex.exec(cm[0])) !== null)
+                html += await processParagraph(pm[0], zip, rels, styleMap);
+            html += '</td>';
+        }
+        html += '</tr>';
+    }
+    return html + '</table>';
+}
+
+async function convertDocxToHtml(buffer) {
+    const zip = await JSZip.loadAsync(buffer);
+    const docXml = await zip.file('word/document.xml')?.async('string');
+    if (!docXml) { logger.warn('DOCX has no word/document.xml'); return ''; }
+    const rels = await loadRelationships(zip);
+    const styleMap = await loadStyleMap(zip);
+    const bodyMatch = docXml.match(/<w:body>([\s\S]*)<\/w:body>/);
+    if (!bodyMatch) return '';
+    const topRegex = /(<w:p[\s>][\s\S]*?<\/w:p>|<w:tbl[\s>][\s\S]*?<\/w:tbl>)/g;
+    let match, html = '';
+    while ((match = topRegex.exec(bodyMatch[1])) !== null) {
+        const el = match[1];
+        try {
+            if (el.startsWith('<w:p'))        html += await processParagraph(el, zip, rels, styleMap);
+            else if (el.startsWith('<w:tbl')) html += await processTable(el, zip, rels, styleMap);
+        } catch (err) {
+            logger.warn('Error processing OOXML element, skipping', { error: err.message });
+        }
+    }
+    return html.replace(/^(\s*<p[^>]*>\s*(<br\s*\/?>)?\s*<\/p>\s*)+|(\s*<p[^>]*>\s*(<br\s*\/?>)?\s*<\/p>\s*)+$/g, '').trim();
+}
+
+// =============================================================================
 
 const yjsService = getYjsService();
 
@@ -530,6 +799,7 @@ const respondWithOperation = (res, result, defaultStatus = 200) => {
     if (!result || result.success === false) {
         throw new AppError(result?.error || result?.message || 'Operation failed', result?.statusCode || 400);
     }
+    if (res.headersSent) return;
     res.status(result.statusCode || defaultStatus).json(result);
 };
 
@@ -2648,21 +2918,38 @@ const fileController = {
                 if (existingFile && overwrite) {
                     // Update existing file based on type
                     if (existingFile.type === 'text') {
-                        // For text files, NEVER overwrite existing Yjs collaborative content
-                        logger.warn('Upload with overwrite attempted on text file - preserving collaborative content', {
+                        // For DOCX/DOC files, convert binary to HTML via enhanced
+                        // OOXML converter that preserves alignment & image dimensions.
+                        const ext = normalizedFilename.toLowerCase().split('.').pop();
+                        let textContent;
+                        if (ext === 'doc' || ext === 'docx') {
+                            try {
+                                textContent = await convertDocxToHtml(uploadedFile.buffer);
+                            } catch (convErr) {
+                                logger.error('DOCX conversion failed, storing empty content', {
+                                    filePath, error: convErr.message
+                                });
+                                textContent = '';
+                            }
+                        } else {
+                            textContent = uploadedFile.buffer.toString('utf8');
+                        }
+                        logger.info('Upload with overwrite replacing Yjs content for text file', {
                             filePath,
                             userId,
                             uploadSize: uploadedFile.buffer.length
                         });
-                        
-                        // Only update metadata, not content
+
+                        // Replace the Yjs document content (handles live clients via PATH A,
+                        // or direct MongoDB replacement via PATH B when no clients are connected)
+                        await yjsService.initializeTextContent(filePath, textContent);
+
+                        // Update metadata
                         existingFile.description = description || existingFile.description;
                         existingFile.tags = parsedTags || existingFile.tags;
                         existingFile.lastModifiedBy = userId;
-                        // Don't update size - keep actual collaborative content size
+                        existingFile.size = uploadedFile.buffer.length;
                         file = await existingFile.save();
-                        
-                        // Do NOT attempt to overwrite Yjs document - it preserves its own content
                     } else {
                         // For binary files, use GridFS storage
                         const content = uploadedFile.buffer.toString('base64');
@@ -2692,10 +2979,28 @@ const fileController = {
                     
                     // Set content based on file type
                     if (file.type === 'text') {
-                        // For text files, just store the content in GridFS as backup
-                        // Yjs document will be created when content is first accessed
-                        const textContent = uploadedFile.buffer.toString('utf8');
-                        await file.setContent(uploadedFile.buffer);
+                        // For DOCX/DOC files, convert binary → HTML via enhanced
+                        // OOXML converter preserving alignment & image dimensions.
+                        const ext = normalizedFilename.toLowerCase().split('.').pop();
+                        let textContent;
+                        if (ext === 'doc' || ext === 'docx') {
+                            try {
+                                textContent = await convertDocxToHtml(uploadedFile.buffer);
+                            } catch (convErr) {
+                                logger.error('DOCX conversion failed for new upload, storing empty', {
+                                    filePath, error: convErr.message
+                                });
+                                textContent = '';
+                            }
+                        } else {
+                            textContent = uploadedFile.buffer.toString('utf8');
+                        }
+                        // Text files use Yjs persistence — do NOT call file.setContent()
+                        // (it throws for text files). Seed the Yjs document directly so
+                        // the collaborative editor shows the uploaded content immediately.
+                        if (textContent.trim()) {
+                            await yjsService.initializeTextContent(filePath, textContent);
+                        }
                     } else {
                         // For binary files, use GridFS storage
                         await file.setContent(uploadedFile.buffer);
@@ -3227,15 +3532,18 @@ async function executeFileOperation(operation, data, userId, userRoles = []) {
                             }]
                         };
 
-                        // Get all children for cache cleanup
-                        const children = await File.find(childQuery, 'filePath').lean();
+                        // Get all children for cache and Yjs cleanup
+                        const children = await File.find(childQuery, 'filePath type').lean();
 
                         // Delete all children in one operation
                         await File.deleteMany(childQuery);
 
-                        // Clear caches for all deleted files
+                        // Clear caches and Yjs documents for all deleted files
                         for (const child of children) {
                             await cache.invalidateAllRelatedCaches('file', child.filePath, userId);
+                            if (child.type === 'text') {
+                                await yjsService.deleteDocument(child.filePath);
+                            }
                         }
                     } else {
                         // Check if directory is empty
@@ -3259,7 +3567,12 @@ async function executeFileOperation(operation, data, userId, userRoles = []) {
                 
                 // Delete the file/directory itself
                 await deleteFile.deleteOne();
-                
+
+                // Purge the Yjs document so re-created files don't load stale content
+                if (deleteFile.type === 'text') {
+                    await yjsService.deleteDocument(effectiveFilePath);
+                }
+
                 // Clear all related caches for owner
                 await cache.invalidateAllRelatedCaches('file', effectiveFilePath, userId);
                 
