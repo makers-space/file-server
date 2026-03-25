@@ -1,4 +1,6 @@
-# App Base Server
+# FilesystemOne — Server
+
+> **Cloud file system platform — store, manage, and collaborate on files from anywhere. Like Google Docs, but better.**
 
 ### Advanced Features
 - **Storage Management**: Intelligent storage routing between inline and GridFS based on file characteristics
@@ -7,12 +9,12 @@
 - **Security**: Helmet, HPP, CORS protection with file upload security
 - **API Documentation**: Comprehensive REST API with filtering, pagination, and sortingckend API Server with Advanced File Management and Real-time Collaboration**
 
-A comprehensive Node.js + Express server application featuring advanced file management, real-time collaboration, Redis caching, and robust authentication systems.
+A comprehensive Node.js + Express server powering FilesystemOne — a cloud-native file system with real-time collaboration, intelligent storage management, Redis caching, and robust authentication.
 
 ## 🚀 Features
 
 ### Core Systems
-- **Advanced Authentication**: JWT-based system with access/refresh tokens, 2FA supp**Built with ❤️ using Node.js, Express, MongoDB, and Redis**ased access control
+- **Advanced Authentication**: JWT-based system with access/refresh tokens, 2FA supp**Built with ❤️ using Node.js, Express, MongoDB, and Redis** — role-based access control
 - **File Management System**: Complete file CRUD with version control, auto-save, and GridFS storage
 - **Real-time Collaboration**: WebSocket-powered collaborative editing using Yjs and y-websocket
 - **Caching Layer**: Redis-powered caching with automatic invalidation and cleanup
@@ -40,7 +42,7 @@ A comprehensive Node.js + Express server application featuring advanced file man
 1. **Clone and Install**
    ```bash
    git clone <repository-url>
-   cd app-base/server
+   cd filesystem-one/file-server
    npm install
    ```
 
@@ -57,7 +59,7 @@ A comprehensive Node.js + Express server application featuring advanced file man
    node -e "console.log('REFRESH_TOKEN_SECRET=' + require('crypto').randomBytes(32).toString('hex'))"
    
    # MongoDB connection (Required)
-   MONGODB_URI=mongodb://localhost:27017/app-base-db
+   MONGODB_URI=mongodb://localhost:27017/filesystem-one-db
    
    # Redis cache (Optional but recommended)
    REDIS_URL=redis://localhost:6379
@@ -170,7 +172,7 @@ MongoDB Atlas is a fully managed cloud database service. Follow these steps to s
 2. Choose **"M0 FREE"** tier (includes 512 MB storage - perfect for development)
 3. Select your preferred **Cloud Provider** (AWS, Google Cloud, or Azure)
 4. Choose a **Region** closest to your location for best performance
-5. Name your cluster (e.g., `AppBaseCluster`) or keep the default name
+5. Name your cluster (e.g., `FilesystemOneCluster`) or keep the default name
 6. Click **"Create Cluster"** (this takes 3-5 minutes)
 
 ### Step 3: Create Database User
@@ -178,7 +180,7 @@ MongoDB Atlas is a fully managed cloud database service. Follow these steps to s
 1. Click **"Database Access"** in the left sidebar under Security
 2. Click **"Add New Database User"**
 3. Choose **"Password"** authentication method
-4. Set a username (e.g., `appbaseuser`)
+4. Set a username (e.g., `filesystemoneuser`)
 5. Click **"Autogenerate Secure Password"** or create your own strong password
 6. **Important**: Copy and save this password securely - you'll need it for your connection string
 7. Under **"Database User Privileges"**, select **"Read and write to any database"**
@@ -208,13 +210,13 @@ MongoDB Atlas is a fully managed cloud database service. Follow these steps to s
 1. Open your `.env` file in the server directory
 2. Replace the `MONGODB_URI` value with your connection string:
    ```bash
-   MONGODB_URI=mongodb+srv://appbaseuser:YOUR_PASSWORD@cluster.mongodb.net/app-base-db?retryWrites=true&w=majority&appName=AppBase
+   MONGODB_URI=mongodb+srv://filesystemoneuser:YOUR_PASSWORD@cluster.mongodb.net/filesystem-one-db?retryWrites=true&w=majority&appName=FilesystemOne
    ```
 3. **Important replacements**:
-   - Replace `<username>` with your database username (e.g., `appbaseuser`)
+   - Replace `<username>` with your database username (e.g., `filesystemoneuser`)
    - Replace `<password>` with your actual database password
-   - Add your database name after `.net/` (e.g., `app-base-db`)
-   - Add `&appName=AppBase` at the end for better monitoring
+   - Add your database name after `.net/` (e.g., `filesystem-one-db`)
+   - Add `&appName=FilesystemOne` at the end for better monitoring
 
 ### Step 7: Test Your Connection
 
@@ -226,7 +228,7 @@ npm run dev
 
 Look for this success message in the console:
 ```
-🌱 MongoDB connection established! cluster.mongodb.net/app-base-db
+🌱 MongoDB connection established! cluster.mongodb.net/filesystem-one-db
 ⚡ Transaction support confirmed
 ```
 
@@ -303,7 +305,7 @@ Gmail provides free SMTP service that's easy to set up. Follow these steps:
 2. Under **"How you sign in to Google"**, click **"App passwords"**
    - If you don't see this option, make sure 2-Step Verification is enabled
 3. Click **"Select app"** and choose **"Other (Custom name)"**
-4. Enter a name like "App Base Server" or "Node Mailer"
+4. Enter a name like "FilesystemOne Server" or "Node Mailer"
 5. Click **"Generate"**
 6. **Important**: Copy the 16-character app password shown (format: `xxxx xxxx xxxx xxxx`)
    - You won't be able to see this password again!
@@ -404,7 +406,7 @@ curl -X POST http://localhost:8080/api/v1/email/test \
   -d '{
     "to": "your-test-email@example.com",
     "subject": "Test Email",
-    "text": "This is a test email from App Base!"
+    "text": "This is a test email from FilesystemOne!"
   }'
 ```
 
@@ -503,7 +505,7 @@ Content-Type: application/json
   "data": {
     "firstName": "John",
     "email": "john@example.com",
-    "appName": "App Base",
+    "appName": "FilesystemOne",
     "appUrl": "http://localhost:8080"
   }
 }
@@ -908,7 +910,7 @@ Before deploying to production, ensure:
 #### Database Connection Failed
 ```bash
 # Check MongoDB status
-mongosh mongodb://localhost:27017/app-base-db
+mongosh mongodb://localhost:27017/filesystem-one-db
 ```
 
 #### Redis Connection Issues

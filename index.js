@@ -1,5 +1,5 @@
 /**
- * Entry point for the App-Base Server application
+ * Entry point for the FilesystemOne Server application
  * Creates and starts the server instance
  */
 

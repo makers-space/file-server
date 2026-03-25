@@ -187,7 +187,7 @@ const sendPasswordResetEmail = async (user, resetToken, resetUrl, transporter = 
  */
 const sendWelcomeEmail = async (user, transporter = null) => {
     return sendEmail({
-        to: user.email, subject: 'Welcome to App Base!', template: 'welcome', data: {
+        to: user.email, subject: 'Welcome to FilesystemOne!', template: 'welcome', data: {
             firstName: user.firstName || user.name || 'User',
             email: user.email,
             loginUrl: `${process.env.APP_URL}/auth/login`
@@ -242,7 +242,7 @@ const sendNewDeviceLoginEmail = async (user, deviceInfo, transporter = null) => 
             device: deviceInfo.platform || 'Unknown',
             browser: deviceInfo.browser ? `${deviceInfo.browser} on ${deviceInfo.os || 'Unknown OS'}` : null,
             appUrl: process.env.APP_URL,
-            appName: process.env.APP_NAME || 'App Base'
+            appName: process.env.APP_NAME || 'FilesystemOne'
         }
     }, transporter);
 };

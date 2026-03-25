@@ -2730,7 +2730,7 @@ const submitContactForm = asyncHandler(async (req, res, next) => {
         // Confirmation Email to User
         sendEmail({
             to: email,
-            subject: 'We received your message - App-Base',
+            subject: 'We received your message - FilesystemOne',
             template: 'contact-confirmation',
             data: {
                 name,
