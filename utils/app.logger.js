@@ -1,5 +1,5 @@
 /**
- * Universal appLogger utility for App Base
+ * Universal appLogger utility for FilesystemOne
  * Provides structured logging using Winston with beautiful console output
  */
 
@@ -116,7 +116,7 @@ function generateBanner(text = process.env.APP_NAME) {
             font: 'AMC Neko', // Use a fun font: Fraktur
             horizontalLayout: 'default',
             verticalLayout: 'default',
-            width: 150,
+            width: 300,
             whitespaceBreak: true
         }, (err, data) => {
             if (err) {
@@ -203,7 +203,7 @@ class DatabaseTransport extends winston.Transport {
             const logData = {
                 timestamp: new Date(info.timestamp),
                 environment: info.environment || process.env.NODE_ENV,
-                service: info.service || 'app-base-server'
+                service: info.service || 'filesystem-one-server'
             };
 
             if (info.method) {
@@ -347,7 +347,7 @@ const appLogger = createLogger({
     levels: customLevels, // Use custom levels
     level: process.env.LOG_LEVEL,
     defaultMeta: {
-        service: 'app-base',
+        service: 'filesystem-one',
         environment: process.env.NODE_ENV
     },
     format: format.combine(
@@ -394,7 +394,7 @@ appLogger.http = async (message, metadata = {}) => {
                 const logData = {
                     timestamp: new Date(),
                     environment: process.env.NODE_ENV,
-                    service: 'app-base-server',
+                    service: 'filesystem-one-server',
                     method: metadata.method,
                     url: metadata.url,
                     statusCode: metadata.statusCode,
@@ -594,7 +594,7 @@ appLogger.websocket = async (message, metadata = {}) => {
                 const logData = {
                     timestamp: new Date(),
                     environment: process.env.NODE_ENV,
-                    service: 'app-base-server',
+                    service: 'filesystem-one-server',
                     ...metadata
                 };
 

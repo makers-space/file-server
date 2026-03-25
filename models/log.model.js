@@ -95,7 +95,7 @@ const logSchema = new mongoose.Schema({
     environment: {
         type: String, default: process.env.NODE_ENV
     }, service: {
-        type: String, default: 'app-base-server'
+        type: String, default: 'filesystem-one-server'
     }, meta: {
         type: mongoose.Schema.Types.Mixed, default: {}
     }
