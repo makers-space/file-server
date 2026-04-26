@@ -118,7 +118,12 @@ const userSchema = new mongoose.Schema({
         type: [String],
         select: false,
         default: []
-    }
+    },
+    // Starred/favorited files (user-specific, doesn't affect the file itself)
+    starredFiles: [{
+        type: mongoose.Schema.Types.ObjectId,
+        ref: 'File'
+    }]
 }, {
     toJSON: {virtuals: false}, toObject: {virtuals: false}
 });
@@ -206,37 +211,44 @@ userSchema.methods.addPasswordToHistory = function (hashedPassword) {
 const User = mongoose.models.User || mongoose.model('User', userSchema);
 
 // =========================================================================
-// FOLLOW SCHEMA (closely tied to users)
+// CONNECTION SCHEMA (LinkedIn-style symmetric connections)
 // =========================================================================
 
-const followSchema = new mongoose.Schema({
-    follower: {
+const connectionSchema = new mongoose.Schema({
+    requester: {
         type: mongoose.Schema.Types.ObjectId,
         ref: 'User',
         required: true,
         index: true
     },
-    following: {
+    recipient: {
         type: mongoose.Schema.Types.ObjectId,
         ref: 'User',
         required: true,
+        index: true
+    },
+    status: {
+        type: String,
+        enum: ['pending', 'accepted', 'rejected'],
+        default: 'pending',
         index: true
     }
 }, {
     timestamps: true
 });
 
-followSchema.index({follower: 1, following: 1}, {unique: true});
-followSchema.index({following: 1, follower: 1});
+connectionSchema.index({requester: 1, recipient: 1}, {unique: true});
+connectionSchema.index({recipient: 1, status: 1});
+connectionSchema.index({requester: 1, status: 1});
 
-followSchema.pre('validate', function (next) {
-    if (this.follower.equals(this.following)) {
-        return next(new Error('Users cannot follow themselves'));
+connectionSchema.pre('validate', function (next) {
+    if (this.requester.equals(this.recipient)) {
+        return next(new Error('Users cannot connect with themselves'));
     }
     next();
 });
 
-const Follow = mongoose.models.Follow || mongoose.model('Follow', followSchema);
+const Connection = mongoose.models.Connection || mongoose.model('Connection', connectionSchema);
 
 export default User;
-export {Follow};
+export {Connection};

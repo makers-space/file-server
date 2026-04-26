@@ -1,5 +1,6 @@
 import jwt from 'jsonwebtoken';
 import User from '../models/user.model.js';
+import File from '../models/file.model.js';
 import {
     normalizeRoles,
     processRolesWithApproval,
@@ -187,7 +188,7 @@ const sendPasswordResetEmail = async (user, resetToken, resetUrl, transporter = 
  */
 const sendWelcomeEmail = async (user, transporter = null) => {
     return sendEmail({
-        to: user.email, subject: 'Welcome to FilesystemOne!', template: 'welcome', data: {
+        to: user.email, subject: 'Welcome to Filesystem One!', template: 'welcome', data: {
             firstName: user.firstName || user.name || 'User',
             email: user.email,
             loginUrl: `${process.env.APP_URL}/auth/login`
@@ -242,7 +243,7 @@ const sendNewDeviceLoginEmail = async (user, deviceInfo, transporter = null) => 
             device: deviceInfo.platform || 'Unknown',
             browser: deviceInfo.browser ? `${deviceInfo.browser} on ${deviceInfo.os || 'Unknown OS'}` : null,
             appUrl: process.env.APP_URL,
-            appName: process.env.APP_NAME || 'FilesystemOne'
+            appName: process.env.APP_NAME || 'Filesystem One'
         }
     }, transporter);
 };
@@ -338,7 +339,25 @@ const authController = {
             }            // Save the user to the database
             await user.save();
 
-            // Use sophisticated cache invalidation for user creation
+            // Create the user's root folder
+            try {
+                const rootPath = `/${user.username}`;
+                const rootExists = await File.exists({ filePath: rootPath, type: 'directory' });
+                if (!rootExists) {
+                    await File.create({
+                        filePath: rootPath,
+                        fileName: user.username,
+                        type: 'directory',
+                        description: 'User root folder',
+                        owner: user._id,
+                    });
+                    logger.info(`[Auth Controller] Created root folder for new user: ${rootPath}`);
+                }
+            } catch (folderError) {
+                logger.warn('[Auth Controller] Failed to create root folder for new user:', {
+                    message: folderError.message, userId: user.id
+                });
+            }
             await cache.invalidateAllRelatedCaches('user', user.id, user.id);
 
             logger.info(`${logger.safeColor(logger.colors.cyan)}[Auth Controller]${logger.safeColor(logger.colors.reset)} Signup: User created successfully`, {
@@ -527,7 +546,7 @@ const authController = {
                 logger.verbose('[Auth Controller - Login] Generated device fingerprint:', {deviceInfo});
 
                 // Check if this is a new device before adding it
-                const isNewDevice = !user.knownDevices || !user.knownDevices.some(device =>
+                const isNewDevice = !user.knownDevices.some(device =>
                     device.deviceFingerprint === deviceInfo.deviceFingerprint
                 );
 

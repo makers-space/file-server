@@ -2,23 +2,23 @@ import mongoose from 'mongoose';
 
 /**
  * Group roles (separate from system-level roles in rights.js):
- *   OWNER   – full control: manage members, permissions, delete any file
- *   ADMIN   – can change file metadata, manage members below admin
- *   CREATOR – can read, write, and share new files to the group
- *   MEMBER  – read-only access to group files
+ *   OWNER – full control: manage members, assign permissions, delete group, read/write all group files
+ *   WRITE – can create/edit/delete files and subdirectories inside the group folder
+ *   READ  – read-only access to all files inside the group folder
+ *
+ * Permissions propagate to every file and directory nested under the group's
+ * rootFolderPath — individual file permissions are not used inside group folders.
  */
 export const GROUP_ROLES = {
     OWNER: 'OWNER',
-    ADMIN: 'ADMIN',
-    CREATOR: 'CREATOR',
-    MEMBER: 'MEMBER'
+    WRITE: 'WRITE',
+    READ: 'READ'
 };
 
 export const GROUP_ROLE_HIERARCHY = {
-    [GROUP_ROLES.OWNER]: 4,
-    [GROUP_ROLES.ADMIN]: 3,
-    [GROUP_ROLES.CREATOR]: 2,
-    [GROUP_ROLES.MEMBER]: 1
+    [GROUP_ROLES.OWNER]: 3,
+    [GROUP_ROLES.WRITE]: 2,
+    [GROUP_ROLES.READ]: 1
 };
 
 const memberSchema = new mongoose.Schema({
@@ -30,40 +30,11 @@ const memberSchema = new mongoose.Schema({
     role: {
         type: String,
         enum: Object.values(GROUP_ROLES),
-        default: GROUP_ROLES.MEMBER
+        default: GROUP_ROLES.READ
     },
     joinedAt: {
         type: Date,
         default: Date.now
-    }
-}, {_id: false});
-
-const groupFileSchema = new mongoose.Schema({
-    file: {
-        type: mongoose.Schema.Types.ObjectId,
-        ref: 'File',
-        required: true
-    },
-    // Who shared/uploaded this file to the group
-    sharedBy: {
-        type: mongoose.Schema.Types.ObjectId,
-        ref: 'User',
-        required: true
-    },
-    sharedAt: {
-        type: Date,
-        default: Date.now
-    },
-    // Optional timeline caption / description
-    caption: {
-        type: String,
-        trim: true,
-        maxlength: 1000
-    },
-    // Pinned files stay at the top of the timeline
-    pinned: {
-        type: Boolean,
-        default: false
     }
 }, {_id: false});
 
@@ -91,14 +62,8 @@ const groupSchema = new mongoose.Schema({
         default: 'private'
     },
     members: [memberSchema],
-    files: [groupFileSchema],
     // Cached member count for efficient queries
     memberCount: {
-        type: Number,
-        default: 0
-    },
-    // Cached file count
-    fileCount: {
         type: Number,
         default: 0
     },
@@ -106,6 +71,11 @@ const groupSchema = new mongoose.Schema({
         type: mongoose.Schema.Types.ObjectId,
         ref: 'User',
         required: true
+    },
+    // Filesystem path for this group's root folder (e.g. /groups/<id>)
+    rootFolderPath: {
+        type: String,
+        default: null
     }
 }, {
     timestamps: true
@@ -115,12 +85,11 @@ const groupSchema = new mongoose.Schema({
 groupSchema.index({createdBy: 1});
 groupSchema.index({'members.user': 1});
 groupSchema.index({privacy: 1, name: 1});
-groupSchema.index({'files.file': 1});
+groupSchema.index({rootFolderPath: 1}); // used by findGroupForFilePath ancestor lookup
 
 // Keep cached counts in sync
 groupSchema.pre('save', function (next) {
     this.memberCount = this.members.length;
-    this.fileCount = this.files.length;
     next();
 });
 

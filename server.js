@@ -188,17 +188,13 @@ class Server {
             userRoutesModule,
             appRoutesModule,
             fileRoutesModule,
-            cacheRoutesModule,
-            groupRoutesModule,
-            commentRoutesModule
+            cacheRoutesModule
         ] = await Promise.all([
             import('./routes/auth.routes.js'),
             import('./routes/user.routes.js'),
             import('./routes/app.routes.js'),
             import('./routes/file.routes.js'),
-            import('./routes/cache.routes.js'),
-            import('./routes/group.routes.js'),
-            import('./routes/comment.routes.js')
+            import('./routes/cache.routes.js')
         ]);
 
         const authRouter = authRoutesModule.default ?? authRoutesModule.router ?? authRoutesModule;
@@ -206,16 +202,12 @@ class Server {
         const appRouter = appRoutesModule.default ?? appRoutesModule.router ?? appRoutesModule;
         const fileRouter = fileRoutesModule.default ?? fileRoutesModule.router ?? fileRoutesModule;
         const cacheRouter = cacheRoutesModule.default ?? cacheRoutesModule.router ?? cacheRoutesModule;
-        const groupRouter = groupRoutesModule.default ?? groupRoutesModule.router ?? groupRoutesModule;
-        const commentRouter = commentRoutesModule.default ?? commentRoutesModule.router ?? commentRoutesModule;
 
         const authValidRoutes = authRoutesModule.validRoutes ?? authRouter.validRoutes ?? [];
         const userValidRoutes = userRoutesModule.validRoutes ?? userRouter.validRoutes ?? [];
         const appValidRoutes = appRoutesModule.validRoutes ?? appRouter.validRoutes ?? [];
         const fileValidRoutes = fileRoutesModule.validRoutes ?? fileRouter.validRoutes ?? [];
         const cacheValidRoutes = cacheRoutesModule.validRoutes ?? cacheRouter.validRoutes ?? [];
-        const groupValidRoutes = groupRoutesModule.validRoutes ?? groupRouter.validRoutes ?? [];
-        const commentValidRoutes = commentRoutesModule.validRoutes ?? commentRouter.validRoutes ?? [];
 
         appMiddleware.registerRoutes([
             '/health',
@@ -223,9 +215,7 @@ class Server {
             ...authValidRoutes,
             ...userValidRoutes,
             ...fileValidRoutes,
-            ...cacheValidRoutes,
-            ...groupValidRoutes,
-            ...commentValidRoutes
+            ...cacheValidRoutes
         ]);
 
         // Apply route validation middleware specifically to /api routes
@@ -236,8 +226,6 @@ class Server {
         this.app.use('/api/v1/users', userRouter);
         this.app.use('/api/v1/files', fileRouter);
         this.app.use('/api/v1/cache', cacheRouter);
-        this.app.use('/api/v1/groups', groupRouter);
-        this.app.use('/api/v1/comments', commentRouter);
         this.app.use('/api/v1', appRouter);
 
         // Handle undefined routes
@@ -414,15 +402,6 @@ class Server {
                                         if (persistedUpdate.length > 0) {
                                             Y.applyUpdate(ydoc, persistedUpdate);
                                         }
-                                        
-                                        // Store any local changes back to persistence
-                                        const currentState = Y.encodeStateAsUpdate(ydoc);
-                                        const persistedStateVector = Y.encodeStateVector(persistedYdoc);
-                                        const diff = Y.encodeStateAsUpdate(ydoc, persistedStateVector);
-                                        
-                                        if (diff.length > 2 && diff.some(value => value !== 0)) {
-                                            await persistence.storeUpdate(docName, diff);
-                                        }
 
                                         // Setup MongoDB persistence for updates with optimized batching
                                         let updateTimeout = null;
@@ -540,6 +519,20 @@ class Server {
                                             });
                                         }
 
+                                        // Compact: replace potentially thousands of stored
+                                        // update records with a single merged snapshot so
+                                        // future loads are fast.  We already have the merged
+                                        // state in ydoc, so this is just a write.
+                                        try {
+                                            const compactedState = Y.encodeStateAsUpdate(ydoc);
+                                            await persistence.clearDocument(docName);
+                                            if (compactedState.length > 2) {
+                                                await persistence.storeUpdate(docName, compactedState);
+                                            }
+                                        } catch (compactErr) {
+                                            logger.warn('Non-fatal: Yjs compaction failed', { docName, error: compactErr.message });
+                                        }
+
                                         persistedYdoc.destroy();
                                     } catch (error) {
                                         logger.error('Failed to bind Yjs persistence state', {
@@ -550,8 +543,23 @@ class Server {
                                 },
                                 writeState: async (docName, ydoc) => {
                                     try {
-                                        // Flush to MongoDB
-                                        await persistence.flushDocument(docName);
+                                        // Cancel the 500ms batching timer — we will persist
+                                        // the full in-memory state ourselves right now.
+                                        if (yjsService?.cancelPendingUpdates) {
+                                            yjsService.cancelPendingUpdates(docName);
+                                        }
+
+                                        // Capture the FULL in-memory state (includes edits
+                                        // the batching timer hasn't persisted yet).  Then
+                                        // replace all accumulated MongoDB records with a
+                                        // single compacted snapshot.  This fixes the race
+                                        // where a refresh loses recent edits and also keeps
+                                        // the collection small for fast future loads.
+                                        const fullState = Y.encodeStateAsUpdate(ydoc);
+                                        await persistence.clearDocument(docName);
+                                        if (fullState.length > 2) {
+                                            await persistence.storeUpdate(docName, fullState);
+                                        }
                                         
                                         // Unbind Redis adapter when document is being written/closed
                                         try {
@@ -618,6 +626,22 @@ class Server {
                                 const docNameFromUrl = decodeURIComponent(
                                     req.url.slice(1).split('?')[0]
                                 );
+
+                                // ── Authorization: verify the user may access this file ──
+                                // docName format is "yjs/<filePath>" e.g. "yjs/userone/file.txt"
+                                // Strip the "yjs" prefix to recover the database filePath.
+                                const filePath = '/' + docNameFromUrl.replace(/^yjs\//, '');
+                                const file = await FileModel.findOne({ filePath });
+                                if (!file) {
+                                    logger.warn('Yjs auth: file not found', { filePath, userId: user?.id });
+                                    ws.close(4404, 'File not found');
+                                    return;
+                                }
+                                if (!file.hasReadAccess(user.id)) {
+                                    logger.warn('Yjs auth: access denied', { filePath, userId: user.id });
+                                    ws.close(4403, 'Access denied');
+                                    return;
+                                }
                                 
                                 // Call setupWSConnection which handles the Yjs sync protocol  
                                 // This will create or retrieve the Y.Doc from the docs cache
@@ -629,35 +653,6 @@ class Server {
                                     docName: docNameFromUrl,
                                     gc: false  // Keep documents in memory for better collaboration
                                 });
-
-                                // CRITICAL FIX: Manually send full document state on every connection
-                                // The standard Yjs sync protocol can fail on reconnections, so we
-                                // explicitly send the document state to ensure clients always sync
-                                try {
-                                    const doc = docs.get(docNameFromUrl);
-                                    if (doc && ws.readyState === WebSocket.OPEN) {
-                                        const encoder = encoding.createEncoder();
-                                        encoding.writeVarUint(encoder, 0); // messageSync
-                                        const update = Y.encodeStateAsUpdate(doc);
-                                        syncProtocol.writeUpdate(encoder, update);
-                                        const message = encoding.toUint8Array(encoder);
-                                        
-                                        // Send the sync message
-                                        ws.send(message, (err) => {
-                                            if (err) {
-                                                logger.error('Failed to send manual sync message', {
-                                                    docName: docNameFromUrl,
-                                                    error: err.message
-                                                });
-                                            }
-                                        });
-                                    }
-                                } catch (syncError) {
-                                    logger.error('Failed to manually sync document', {
-                                        docName: docNameFromUrl,
-                                        error: syncError.message
-                                    });
-                                }
 
                                 logger.debug('Yjs WebSocket connection established', {
                                     userId: user.id,
@@ -712,7 +707,7 @@ class Server {
                     appController.getHealth(mockReq, mockRes);
 
                     // Now show startup banner
-                    await logger.startupMessage("FilesystemOne", serverPort, this.config.environment);
+                    await logger.startupMessage("Filesystem One", serverPort, this.config.environment);
 
                     resolve(this.server);
                 });

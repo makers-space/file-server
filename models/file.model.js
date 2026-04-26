@@ -47,7 +47,7 @@ const BINARY_FILE_EXTENSIONS = [
  * Separates text files (collaborative) from binary files (traditional storage)
  */
 const fileSchema = new mongoose.Schema({
-    // Filesystem path (Unix-style absolute path) - UNIQUE per owner
+    // Filesystem path (Unix-style absolute path) - globally UNIQUE
     filePath: {
         type: String,
         required: true,
@@ -88,7 +88,7 @@ const fileSchema = new mongoose.Schema({
         }
     },
 
-    // File name with extension (extracted from path)
+    // Base name of this filesystem node (file or directory), extracted from filePath
     fileName: {
         type: String,
         required: function () {
@@ -235,8 +235,8 @@ const fileSchema = new mongoose.Schema({
     toObject: {virtuals: true}
 });
 
-// CRITICAL: Unique compound index - one file per path per owner
-fileSchema.index({filePath: 1, owner: 1}, {unique: true});
+// CRITICAL: Unique index - one document per path (users have personal root folders)
+fileSchema.index({filePath: 1}, {unique: true});
 
 // Performance indexes
 fileSchema.index({owner: 1, createdAt: -1});
@@ -271,8 +271,8 @@ fileSchema.pre('save', async function(next) {
             this.parentPath = lastSlash === 0 ? '/' : this.filePath.substring(0, lastSlash);
         }
         
-        // Calculate fileName for non-directory files
-        if (this.type !== 'directory') {
+        // Calculate fileName for all file types (including directories)
+        if (this.filePath !== '/') {
             const parts = this.filePath.split('/');
             this.fileName = parts[parts.length - 1];
         }
@@ -636,8 +636,12 @@ fileSchema.methods.shareWithUsers = async function(userIds, permission = 'read')
         throw new Error('Permission must be either "read" or "write"');
     }
 
-    // Convert userIds to array if it's a string
-    const userIdsArray = Array.isArray(userIds) ? userIds : [userIds];
+    // Convert userIds to array, filtering out the file owner — they
+    // already have full access via the owner field.
+    const ownerStr = this.owner.toString();
+    const userIdsArray = (Array.isArray(userIds) ? userIds : [userIds])
+        .filter(id => id.toString() !== ownerStr);
+    if (userIdsArray.length === 0) return this;
     
     // Add users to the appropriate permission array for this file
     for (const userId of userIdsArray) {
@@ -656,9 +660,18 @@ fileSchema.methods.shareWithUsers = async function(userIds, permission = 'read')
         }
     }
     
-    // Propagate permissions to parent directories
+    // Propagate READ-ONLY access up the parent chain so the recipient can navigate
+    // to the shared item through the tree.  Write is never propagated upward —
+    // the destination write-check on create/createDir prevents actual writes to
+    // those ancestor directories.
     await this.constructor.propagatePermissionsToParents(this.filePath, userIdsArray, permission);
-    
+
+    // Cascade the full permission (read OR write) down to all children so every
+    // file/subfolder inside the shared directory is accessible at the same level.
+    if (this.type === 'directory') {
+        await this.constructor.cascadePermissionsToChildren(this.filePath, userIdsArray, permission);
+    }
+
     return this;
 };
 
@@ -686,28 +699,123 @@ fileSchema.statics.propagatePermissionsToParents = async function(filePath, user
         parentPaths.unshift('/');
     }
 
-    // Update permissions for all parent directories
+    // Grant read on all parent directories so the recipient can
+    // navigate to the shared item through the tree.
     for (const parentPath of parentPaths) {
-        const updateOperation = {};
-        
-        if (permission === 'read' || permission === 'both') {
-            updateOperation.$addToSet = updateOperation.$addToSet || {};
-            updateOperation.$addToSet['permissions.read'] = { $each: userIdsArray };
-        }
-        
-        if (permission === 'write' || permission === 'both') {
-            updateOperation.$addToSet = updateOperation.$addToSet || {};
-            updateOperation.$addToSet['permissions.write'] = { $each: userIdsArray };
+        await this.updateOne(
+            { filePath: parentPath, type: 'directory' },
+            { $addToSet: { 'permissions.read': { $each: userIdsArray } } }
+        );
+    }
+};
+
+// Static method to cascade permissions DOWN to all children of a directory
+fileSchema.statics.cascadePermissionsToChildren = async function(dirPath, userIds, permission = 'read') {
+    const userIdsArray = Array.isArray(userIds) ? userIds : [userIds];
+    const escaped = dirPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+    const updateOp = { $addToSet: { 'permissions.read': { $each: userIdsArray } } };
+    if (permission === 'write') {
+        updateOp.$addToSet['permissions.write'] = { $each: userIdsArray };
+    }
+
+    await this.updateMany(
+        { filePath: { $regex: `^${escaped}/` } },
+        updateOp
+    );
+};
+
+// Static method to cascade permission REMOVAL down to all children of a directory
+fileSchema.statics.removePermissionsFromChildren = async function(dirPath, userIds, permission = 'both') {
+    const userIdsArray = Array.isArray(userIds) ? userIds : [userIds];
+    const escaped = dirPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+    const pullOp = {};
+    if (permission === 'read' || permission === 'both') {
+        pullOp['permissions.read'] = { $in: userIdsArray };
+    }
+    if (permission === 'write' || permission === 'both') {
+        pullOp['permissions.write'] = { $in: userIdsArray };
+    }
+
+    await this.updateMany(
+        { filePath: { $regex: `^${escaped}/` } },
+        { $pull: pullOp }
+    );
+};
+
+// Static method to clean up parent directory READ permissions after unsharing.
+// For each ancestor (bottom-up), check which of the unshared users still have
+// at least one shared descendant.  Remove the rest from that ancestor's read
+// list.  Once a user is found to still be needed at a level, they're needed at
+// all higher levels too, so we stop checking them.
+// Complexity: O(depth) DB queries regardless of user count.
+fileSchema.statics.cleanupParentPermissions = async function(filePath, userIds) {
+    if (!filePath || filePath === '/') return;
+
+    const userIdsArray = (Array.isArray(userIds) ? userIds : [userIds])
+        .map(id => id.toString());
+    const pathParts = filePath.split('/').filter(p => p !== '');
+
+    // Build ancestor paths from immediate parent up to root
+    const ancestors = [];
+    for (let i = pathParts.length - 1; i >= 1; i--) {
+        ancestors.push('/' + pathParts.slice(0, i).join('/'));
+    }
+    if (pathParts.length > 1) ancestors.push('/');
+    if (ancestors.length === 0) return;
+
+    // Track which users still need cleanup — shrinks as users are found "still needed"
+    let pendingUsers = new Set(userIdsArray);
+
+    for (const ancestorPath of ancestors) {
+        if (pendingUsers.size === 0) break;
+
+        const escaped = ancestorPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const descendantFilter = ancestorPath === '/'
+            ? { $regex: /^\//, $ne: '/' }
+            : { $regex: new RegExp(`^${escaped}/`) };
+
+        // One query: find which of pendingUsers still appear in any descendant's permissions
+        const pendingArray = Array.from(pendingUsers);
+        const docs = await this.find(
+            {
+                filePath: descendantFilter,
+                $or: [
+                    { 'permissions.read': { $in: pendingArray } },
+                    { 'permissions.write': { $in: pendingArray } }
+                ]
+            },
+            { 'permissions.read': 1, 'permissions.write': 1 }
+        ).lean().limit(pendingArray.length * 2); // early-stop: we only need enough to find all users
+
+        // Collect which pending users are still referenced
+        const stillNeeded = new Set();
+        for (const doc of docs) {
+            for (const id of (doc.permissions?.read || [])) {
+                const s = id.toString();
+                if (pendingUsers.has(s)) stillNeeded.add(s);
+            }
+            for (const id of (doc.permissions?.write || [])) {
+                const s = id.toString();
+                if (pendingUsers.has(s)) stillNeeded.add(s);
+            }
+            // If we've accounted for every pending user, stop scanning docs
+            if (stillNeeded.size === pendingUsers.size) break;
         }
 
-        // Update parent directory permissions
-        await this.updateOne(
-            { 
-                filePath: parentPath, 
-                type: 'directory' 
-            },
-            updateOperation
-        );
+        // Users NOT still needed → remove from this ancestor
+        const toRemove = pendingArray.filter(id => !stillNeeded.has(id));
+        if (toRemove.length > 0) {
+            await this.updateOne(
+                { filePath: ancestorPath, type: 'directory' },
+                { $pull: { 'permissions.read': { $in: toRemove } } }
+            );
+        }
+
+        // Users that ARE still needed at this level are needed at all higher levels —
+        // stop checking them.  Only continue with users we just removed.
+        pendingUsers = new Set(toRemove);
     }
 };
 
@@ -843,46 +951,37 @@ fileSchema.statics.findWithReadPermission = function(query, userId, userRoles = 
 };
 
 // Static method to find one file with read permission
-fileSchema.statics.findOneWithReadPermission = function(query, userId, userRoles = []) {
-    const permissionQuery = {
+fileSchema.statics.findOneWithReadPermission = async function(query, userId, userRoles = []) {
+    return this.findOne({
+        ...query,
         $or: [
             { owner: userId },
             { 'permissions.read': userId },
             { 'permissions.write': userId }
         ]
-    };
-    
-    // Only file owners and explicitly granted users can read
-    // No role-based override for file permissions
-    return this.findOne({ ...query, ...permissionQuery });
+    });
 };
 
 // Static method to find files with write permission
 fileSchema.statics.findWithWritePermission = function(query, userId, userRoles = []) {
-    const permissionQuery = {
+    return this.find({
+        ...query,
         $or: [
             { owner: userId },
             { 'permissions.write': userId }
         ]
-    };
-    
-    // Only file owners and explicitly granted users can write
-    // No role-based override for file permissions
-    return this.find({ ...query, ...permissionQuery });
+    });
 };
 
 // Static method to find one file with write permission
-fileSchema.statics.findOneWithWritePermission = function(query, userId, userRoles = []) {
-    const permissionQuery = {
+fileSchema.statics.findOneWithWritePermission = async function(query, userId, userRoles = []) {
+    return this.findOne({
+        ...query,
         $or: [
             { owner: userId },
             { 'permissions.write': userId }
         ]
-    };
-    
-    // Only file owners and explicitly granted users can write
-    // No role-based override for file permissions
-    return this.findOne({ ...query, ...permissionQuery });
+    });
 };
 
 fileSchema.statics.buildTree = function(items, rootPath = '/') {

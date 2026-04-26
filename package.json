@@ -1,7 +1,7 @@
 {
   "name": "filesystem-one-server",
   "version": "1.0.0",
-  "description": "FilesystemOne — Cloud File System Server",
+  "description": "Filesystem One — Cloud File System Server",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",

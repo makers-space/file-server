@@ -79,11 +79,13 @@ router.post('/logout',
 // Add a route to get user profile with caching
 router.get('/me',
     authMiddleware.verifyToken(),
-    cacheResponse(1800, (req) => `user:profile:${req.user.id}`), // Cache for 30 minutes
-    (req, res) => {
-        // Use formatUserResponse for consistent response structure
-        // Format user response directly (internal formatting logic)
-        const formattedUser = {
+    async (req, res) => {
+        // Fetch live roleApprovalStatus and pendingRoles from DB (not in JWT)
+        const User = (await import('../models/user.model.js')).default;
+        const dbUser = await User.findById(req.user.id).select('roleApprovalStatus pendingRoles roleApprovalRequest').lean();
+        res.status(200).json({
+            success: true,
+            message: 'User profile retrieved successfully',
             user: {
                 id: req.user.id,
                 firstName: req.user.firstName,
@@ -95,16 +97,12 @@ router.get('/me',
                 emailVerified: req.user.emailVerified,
                 twoFactorEnabled: req.user.twoFactorEnabled,
                 profilePhoto: req.user.profilePhoto,
-                active: req.user.active !== undefined ? req.user.active : true
-            }
-        };
-        res.status(200).json({
-            success: true,
-            message: 'User profile retrieved successfully',
-            user: formattedUser.user,
-            meta: {
-                timestamp: new Date().toISOString()
-            }
+                active: req.user.active !== undefined ? req.user.active : true,
+                roleApprovalStatus: dbUser?.roleApprovalStatus || null,
+                pendingRoles: dbUser?.pendingRoles || [],
+                roleApprovalRequest: dbUser?.roleApprovalRequest || null
+            },
+            meta: { timestamp: new Date().toISOString() }
         });
     }
 );
