@@ -3,8 +3,9 @@ import userController from '../controllers/user.controller.js';
 import * as userMiddleware from '../middleware/user.middleware.js';
 import * as authMiddleware from '../middleware/auth.middleware.js';
 import {validateRequest} from '../middleware/validation.middleware.js';
-import {userSchemas, fileSchemas, statsSchemas} from '../models/schemas.js';
+import {userSchemas, fileSchemas, statsSchemas, groupSchemas} from '../models/schemas.js';
 import {RIGHTS} from '../config/rights.js';
+import {GROUP_ROLES} from '../models/group.model.js';
 import {cacheResponse, clearCache, autoInvalidateCache} from '../middleware/cache.middleware.js';
 
 const router = Router();
@@ -13,18 +14,28 @@ const router = Router();
 router.validRoutes = [
     '/api/v1/users',
     '/api/v1/users/public',
-    '/api/v1/users/mutuals',
+    '/api/v1/users/connections/pending',
+    '/api/v1/users/connections/sent',
     '/api/v1/users/stats/overview',
     '/api/v1/users/:id',
     '/api/v1/users/:id/password',
     '/api/v1/users/:id/files',
     '/api/v1/users/:id/stats',
     '/api/v1/users/:id/stats/fields',
-    '/api/v1/users/:id/follow',
-    '/api/v1/users/:id/following',
-    '/api/v1/users/:id/followers',
-    '/api/v1/users/:id/follow-counts',
-    '/api/v1/users/:id/follow-status'
+    '/api/v1/users/:id/connect',
+    '/api/v1/users/:id/connections',
+    '/api/v1/users/:id/connection-counts',
+    '/api/v1/users/:id/connection-status',
+    '/api/v1/users/groups',
+    '/api/v1/users/groups/discover',
+    '/api/v1/users/groups/:groupId',
+    '/api/v1/users/groups/:groupId/members',
+    '/api/v1/users/groups/:groupId/members/:userId',
+    '/api/v1/users/groups/:groupId/join',
+    '/api/v1/users/groups/:groupId/leave',
+    '/api/v1/users/groups/:groupId/transfer',
+    '/api/v1/users/starred',
+    '/api/v1/users/starred/:fileId'
 ];
 
 /**
@@ -35,10 +46,14 @@ router.validRoutes = [
  */
 router.get('/public',
     authMiddleware.verifyToken(),
-    cacheResponse(1800, (req) => {
-        const params = req.query ? new URLSearchParams(req.query).toString() : '';
-        return `users:public:${params ? Buffer.from(params).toString('base64') : 'all'}`;
-    }), // Cache for 30 minutes
+    (req, res, next) => {
+        // Skip cache for search queries — results are dynamic
+        if (req.query.search) return next();
+        cacheResponse(1800, (req) => {
+            const params = req.query ? new URLSearchParams(req.query).toString() : '';
+            return `users:public:${params ? Buffer.from(params).toString('base64') : 'all'}`;
+        })(req, res, next);
+    },
     userController.getPublicUsers
 );
 
@@ -46,61 +61,97 @@ router.get('/public',
 router.use(authMiddleware.verifyToken());
 
 // =========================================================================
-// FOLLOW ROUTES (nested under /users)
+// CONNECTION ROUTES (nested under /users)
 // =========================================================================
 
 /**
- * Get Mutuals:
- * Route Definition: GET /api/v1/users/mutuals
+ * Get Pending Incoming Requests:
+ * Route Definition: GET /api/v1/users/connections/pending
  * Permission: Authenticated
  * Note: Must be before /:id routes to avoid param conflict
  */
-router.get('/mutuals', userController.getMutuals);
+router.get('/connections/pending', userController.getPendingRequests);
 
 /**
- * Follow a user:
- * Route Definition: POST /api/v1/users/:id/follow
+ * Get Sent Outgoing Requests:
+ * Route Definition: GET /api/v1/users/connections/sent
  * Permission: Authenticated
+ * Note: Must be before /:id routes to avoid param conflict
  */
-router.post('/:id/follow', userController.followUser);
+router.get('/connections/sent', userController.getSentRequests);
+
+// =========================================================================
+// STARRED FILES ROUTES (must be before /:id routes)
+// =========================================================================
 
 /**
- * Unfollow a user:
- * Route Definition: DELETE /api/v1/users/:id/follow
+ * Get starred files:
+ * Route Definition: GET /api/v1/users/starred
  * Permission: Authenticated
  */
-router.delete('/:id/follow', userController.unfollowUser);
-
-/**
- * Get Following List:
- * Route Definition: GET /api/v1/users/:id/following
- * Permission: Authenticated
- */
-router.get('/:id/following', userController.getFollowing);
-
-/**
- * Get Followers List:
- * Route Definition: GET /api/v1/users/:id/followers
- * Permission: Authenticated
- */
-router.get('/:id/followers', userController.getFollowers);
-
-/**
- * Get Follow Counts:
- * Route Definition: GET /api/v1/users/:id/follow-counts
- * Permission: Authenticated
- */
-router.get('/:id/follow-counts',
-    cacheResponse(60, (req) => `follows:counts:${req.params.id}`),
-    userController.getFollowCounts
+router.get('/starred',
+    cacheResponse(120, (req) => `user:starred:${req.user.id}`),
+    userController.getStarredFiles
 );
 
 /**
- * Check Follow Status:
- * Route Definition: GET /api/v1/users/:id/follow-status
+ * Star a file:
+ * Route Definition: POST /api/v1/users/starred/:fileId
+ * Permission: Authenticated (must have read access)
+ */
+router.post('/starred/:fileId', userController.starFile);
+
+/**
+ * Unstar a file:
+ * Route Definition: DELETE /api/v1/users/starred/:fileId
  * Permission: Authenticated
  */
-router.get('/:id/follow-status', userController.getFollowStatus);
+router.delete('/starred/:fileId', userController.unstarFile);
+
+/**
+ * Send a connection request:
+ * Route Definition: POST /api/v1/users/:id/connect
+ * Permission: Authenticated
+ */
+router.post('/:id/connect', userController.sendConnectionRequest);
+
+/**
+ * Respond to a connection request (accept/reject):
+ * Route Definition: PUT /api/v1/users/:id/connect
+ * Permission: Authenticated
+ */
+router.put('/:id/connect', userController.respondToConnection);
+
+/**
+ * Remove a connection or cancel a sent request:
+ * Route Definition: DELETE /api/v1/users/:id/connect
+ * Permission: Authenticated
+ */
+router.delete('/:id/connect', userController.removeConnection);
+
+/**
+ * Get Connections List:
+ * Route Definition: GET /api/v1/users/:id/connections
+ * Permission: Authenticated
+ */
+router.get('/:id/connections', userController.getConnections);
+
+/**
+ * Get Connection Counts:
+ * Route Definition: GET /api/v1/users/:id/connection-counts
+ * Permission: Authenticated
+ */
+router.get('/:id/connection-counts',
+    cacheResponse(60, (req) => `connections:counts:${req.params.id}`),
+    userController.getConnectionCounts
+);
+
+/**
+ * Check Connection Status:
+ * Route Definition: GET /api/v1/users/:id/connection-status
+ * Permission: Authenticated
+ */
+router.get('/:id/connection-status', userController.getConnectionStatus);
 
 // ADMIN-ONLY ROUTES (require MANAGE_ALL_USERS permission)
 
@@ -149,6 +200,74 @@ router.post('/',
     clearCache(['users:list:*', 'users:stats:*']),
     autoInvalidateCache('user', (req) => req.body.id || 'new_user'),
     userController.createUser
+);
+
+// Group routes (nested under /users/groups) — must be before /:id parameterized routes
+
+router.get('/groups', userController.getMyGroups);
+
+router.get('/groups/discover', userController.discoverGroups);
+
+router.post('/groups',
+    validateRequest(groupSchemas.createGroup),
+    userController.createGroup
+);
+
+router.get('/groups/:groupId',
+    userMiddleware.loadGroup,
+    userMiddleware.requireMembership,
+    userController.getGroup
+);
+
+router.patch('/groups/:groupId',
+    userMiddleware.loadGroup,
+    userMiddleware.requireGroupRole(GROUP_ROLES.OWNER),
+    validateRequest(groupSchemas.updateGroup),
+    userController.updateGroup
+);
+
+router.delete('/groups/:groupId',
+    userMiddleware.loadGroup,
+    userMiddleware.requireGroupRole(GROUP_ROLES.OWNER),
+    userController.deleteGroup
+);
+
+router.post('/groups/:groupId/members',
+    userMiddleware.loadGroup,
+    userMiddleware.requireGroupRole(GROUP_ROLES.OWNER),
+    validateRequest(groupSchemas.addMember),
+    userController.addMember
+);
+
+router.delete('/groups/:groupId/members/:userId',
+    userMiddleware.loadGroup,
+    userMiddleware.requireMembership,
+    userController.removeMember
+);
+
+router.patch('/groups/:groupId/members/:userId',
+    userMiddleware.loadGroup,
+    userMiddleware.requireGroupRole(GROUP_ROLES.OWNER),
+    validateRequest(groupSchemas.updateMemberRole),
+    userController.updateMemberRole
+);
+
+router.post('/groups/:groupId/join',
+    userMiddleware.loadGroup,
+    userController.joinGroup
+);
+
+router.post('/groups/:groupId/leave',
+    userMiddleware.loadGroup,
+    userMiddleware.requireMembership,
+    userController.leaveGroup
+);
+
+router.patch('/groups/:groupId/transfer',
+    userMiddleware.loadGroup,
+    userMiddleware.requireGroupRole(GROUP_ROLES.OWNER),
+    validateRequest(groupSchemas.transferOwnership),
+    userController.transferOwnership
 );
 
 // SELF-ACCESS AND ADMIN ROUTES (use checkResourceOwnership for permission control)

@@ -462,9 +462,9 @@ export const fileSchemas = {
         description: Joi.string().min(0).max(500)
     }),
 
-    publishFile: Joi.object({
+    createVersion: Joi.object({
         message: Joi.string().max(200)
-            .default('Published version')
+            .default('Version saved')
             .messages({
                 'string.max': 'Message cannot exceed 200 characters'
             })
@@ -509,7 +509,8 @@ export const fileSchemas = {
         format: Joi.string().valid('array', 'object').default('object')
             .messages({
                 'any.only': 'Format must be either "array" or "object"'
-            })
+            }),
+        access: Joi.string().valid('read', 'write').optional()
     }),
 
     getDirectoryContents: Joi.object({
@@ -752,16 +753,17 @@ export const groupSchemas = {
                 'objectId.invalid': 'User ID must be a valid MongoDB ObjectID',
                 'any.required': 'User ID is required'
             }),
-        role: Joi.string().valid(...VALID_GROUP_ROLES).default('MEMBER')
+        // OWNER is only set at creation or via ownership transfer; direct assignment is WRITE/READ only
+        role: Joi.string().valid('WRITE', 'READ').default('READ')
             .messages({
-                'any.only': `Role must be one of: ${VALID_GROUP_ROLES.join(', ')}`
+                'any.only': 'Role must be either "WRITE" or "READ"'
             })
     }),
 
     updateMemberRole: Joi.object({
-        role: Joi.string().valid(...VALID_GROUP_ROLES).required()
+        role: Joi.string().valid('WRITE', 'READ').required()
             .messages({
-                'any.only': `Role must be one of: ${VALID_GROUP_ROLES.join(', ')}`,
+                'any.only': 'Role must be either "WRITE" or "READ"',
                 'any.required': 'Role is required'
             })
     }),
@@ -772,24 +774,7 @@ export const groupSchemas = {
                 'objectId.invalid': 'User ID must be a valid MongoDB ObjectID',
                 'any.required': 'User ID is required'
             })
-    }),
-
-    shareFile: Joi.object({
-        fileId: Joi.objectId().required()
-            .messages({
-                'objectId.invalid': 'File ID must be a valid MongoDB ObjectID',
-                'any.required': 'File ID is required'
-            }),
-        caption: Joi.string().max(1000).allow('')
-            .messages({
-                'string.max': 'Caption cannot exceed 1000 characters'
-            })
-    }),
-
-    updateGroupFile: Joi.object({
-        caption: Joi.string().max(1000).allow(''),
-        pinned: Joi.boolean()
-    }).min(1)
+    })
 };
 
 // =============================================================================

@@ -2,7 +2,7 @@ import {Router} from 'express';
 import fileController from '../controllers/file.controller.js';
 import * as authMiddleware from '../middleware/auth.middleware.js';
 import {validateRequest} from '../middleware/validation.middleware.js';
-import {fileSchemas, fileParamSchemas} from '../models/schemas.js';
+import {fileSchemas, fileParamSchemas, commentSchemas} from '../models/schemas.js';
 import {cacheResponse, clearCache, autoInvalidateCache} from '../middleware/cache.middleware.js';
 import {RIGHTS} from '../config/rights.js';
 import {upload, handleFileErrors} from '../middleware/file.middleware.js';
@@ -18,6 +18,7 @@ router.validRoutes = [
     '/api/v1/files/admin/stats',              // Admin stats alias (HTTP - admin only)
     '/api/v1/files/demo',                     // Demo files (HTTP - public)
     '/api/v1/files/bulk',                     // Bulk operations (HTTP - complex operations)
+    '/api/v1/files/extract-zip',                // Extract zip file contents
     '/api/v1/files/tree',                     // Directory tree (HTTP - complex structure)
     '/api/v1/files/upload',                   // File uploads (HTTP - multipart required)
     '/api/v1/files/directory/contents',       // Directory contents (HTTP - listing)
@@ -27,14 +28,18 @@ router.validRoutes = [
     '/api/v1/files/copy',                     // Copy operations
     '/api/v1/files/:filePath/content',        // File content retrieval and save
     '/api/v1/files/:filePath/metadata',       // File metadata retrieval
-    '/api/v1/files/:filePath/publish',        // Publish versions
-    '/api/v1/files/:filePath/versions',       // Version listing
+    '/api/v1/files/:filePath/versions',       // Version listing and creation
     '/api/v1/files/:filePath/versions/:versionNumber', // Version load/delete
     '/api/v1/files/:filePath/rename',         // Rename files or directories
     '/api/v1/files/:filePath',                // File deletion
     '/api/v1/files/:filePath/download',       // File downloads (HTTP - streaming required)
     '/api/v1/files/:filePath/collaborators',  // Active collaborators (HTTP - session info)
     '/api/v1/files/:filePath/share',          // File sharing (HTTP - permission management)
+    '/api/v1/files/comments',                 // Create comment
+    '/api/v1/files/comments/file/:fileId',    // Get file comments
+    '/api/v1/files/comments/file/:fileId/count', // Get comment count
+    '/api/v1/files/comments/:commentId',      // Update/delete comment
+    '/api/v1/files/comments/:commentId/replies' // Get comment replies
 ];
 
 // Health check endpoint (admin only)
@@ -118,6 +123,21 @@ router.post('/bulk',
     ]),
     autoInvalidateCache('file'),
     fileController.bulkOperations
+);
+
+/**
+ * @route   POST /api/v1/files/extract-zip
+ * @desc    Extract a zip file into a target directory
+ * @access  Private (requires authentication)
+ */
+router.post('/extract-zip',
+    authMiddleware.verifyToken(),
+    clearCache((req) => [
+        `user:files:${req.user.id}:all`,
+        `directory:tree:${req.user.id}`
+    ]),
+    autoInvalidateCache('file'),
+    fileController.extractZip
 );
 
 /**
@@ -281,11 +301,11 @@ router.put('/:filePath/content',
     fileController.saveFileContent
 );
 
-router.post('/:filePath/publish',
+router.post('/:filePath/versions',
     validateRequest(fileParamSchemas.filePath, 'params'),
-    validateRequest(fileSchemas.publishFile),
+    validateRequest(fileSchemas.createVersion),
     autoInvalidateCache('file', (req) => req.params.filePath, (req) => req.user.id),
-    fileController.publishFileVersion
+    fileController.saveFileVersion
 );
 
 router.get('/:filePath/versions/:versionNumber',
@@ -359,5 +379,36 @@ router.delete('/:filePath',
 
 // Add file handling error middleware (includes upload error handling)
 router.use(handleFileErrors);
+
+// Comment routes (nested under /files/comments)
+router.post('/comments',
+    validateRequest(commentSchemas.createComment),
+    fileController.createComment
+);
+
+router.get('/comments/file/:fileId',
+    fileController.getFileComments
+);
+
+router.get('/comments/file/:fileId/count',
+    cacheResponse(30, (req) => {
+        const groupId = req.query.groupId || 'all';
+        return `comments:count:${req.params.fileId}:${groupId}`;
+    }),
+    fileController.getCommentCount
+);
+
+router.get('/comments/:commentId/replies',
+    fileController.getReplies
+);
+
+router.patch('/comments/:commentId',
+    validateRequest(commentSchemas.updateComment),
+    fileController.updateComment
+);
+
+router.delete('/comments/:commentId',
+    fileController.deleteComment
+);
 
 export default router;

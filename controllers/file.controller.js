@@ -1,4 +1,7 @@
 import File from '../models/file.model.js';
+import Comment from '../models/comment.model.js';
+import Group from '../models/group.model.js';
+import User, {Connection} from '../models/user.model.js';
 import {asyncHandler} from '../middleware/app.middleware.js';
 import {AppError} from '../middleware/error.middleware.js';
 import {hasRight, RIGHTS} from '../config/rights.js';
@@ -17,6 +20,7 @@ import {renameInGridFS, getGridFSBucket, storeInGridFS, retrieveFromGridFS} from
 import {parseBuffer} from 'music-metadata';
 import ffmpeg from 'fluent-ffmpeg';
 import sharp from 'sharp';
+import {sanitizeHtmlInput} from '../utils/sanitize.js';
 import JSZip from 'jszip';
 
 // =============================================================================
@@ -665,15 +669,31 @@ const hasAdminContentAccess = (userRoles) => {
  * @param {String} filePath - Full file path
  * @param {String} userId - User ID who owns the file
  */
+/**
+ * Resolve the workspace owner from a file path.
+ * The first path segment is treated as the username (e.g. /userone/… → userone).
+ * Falls back to the provided userId when the segment isn't a known user.
+ */
+const resolveWorkspaceOwner = async (filePath, fallbackUserId) => {
+    const segments = filePath.split('/').filter(Boolean);
+    if (segments.length === 0) return fallbackUserId;
+    const workspaceOwner = await User.findOne({ username: segments[0] }).select('_id').lean();
+    return workspaceOwner ? workspaceOwner._id : fallbackUserId;
+};
+
 const ensureParentDirs = async (filePath, userId) => {
     const dirs = filePath.split('/').slice(0, -1); // Remove only filename, keep empty root element
+    
+    // Resolve the workspace owner once — all parent dirs should be owned by
+    // the workspace user, not by whoever triggered the operation.
+    const ownerId = await resolveWorkspaceOwner(filePath, userId);
     
     for (let i = 0; i < dirs.length; i++) {
         // Handle root directory case
         if (i === 0 && dirs[i] === '') {
-            const rootExists = await File.findOne({ filePath: '/', type: 'directory', owner: userId });
-            if (!rootExists) {
-                await File.create({
+            await File.findOneAndUpdate(
+                { filePath: '/', type: 'directory' },
+                { $setOnInsert: {
                     filePath: '/',
                     fileName: 'root',
                     type: 'directory',
@@ -681,21 +701,21 @@ const ensureParentDirs = async (filePath, userId) => {
                     parentPath: null,
                     depth: 0,
                     description: 'Root directory',
-                    owner: userId,
-                    lastModifiedBy: userId,
+                    owner: ownerId,
+                    lastModifiedBy: ownerId,
                     permissions: { read: [], write: [] },
                     size: 0
-                });
-            }
+                }},
+                { upsert: true, setDefaultsOnInsert: false }
+            );
             continue;
         }
         
         // Handle regular directories
         const dirPath = '/' + dirs.slice(1, i + 1).join('/');
-        const exists = await File.findOne({ filePath: dirPath, type: 'directory', owner: userId });
-        
-        if (!exists) {
-            await File.create({
+        await File.findOneAndUpdate(
+            { filePath: dirPath, type: 'directory' },
+            { $setOnInsert: {
                 filePath: dirPath,
                 fileName: dirs[i],
                 type: 'directory',
@@ -703,13 +723,17 @@ const ensureParentDirs = async (filePath, userId) => {
                 parentPath: i === 1 ? '/' : '/' + dirs.slice(1, i).join('/'),
                 depth: i,
                 description: `Directory: ${dirs[i]}`,
-                owner: userId,
-                lastModifiedBy: userId,
+                owner: ownerId,
+                lastModifiedBy: ownerId,
                 permissions: { read: [], write: [] },
                 size: 0
-            });
-        }
+            }},
+            { upsert: true, setDefaultsOnInsert: false }
+        );
     }
+    
+    // Return resolved owner so callers can reuse it without a second lookup
+    return ownerId;
 };
 
 const normalizeFilePath = (filePath = '') => 
@@ -766,6 +790,16 @@ const decodeFilePath = (encodedPath) => {
 };
 
 /**
+ * Enforces that a file path is scoped within the user's root namespace (/<username>/).
+ * Paths that don't already start with /<username>/ are automatically prefixed.
+ * The bare root "/" is rejected as inaccessible to all users.
+ *
+ * @param {string} filePath - Absolute file path (may or may not include username prefix)
+ * @param {string} username - The authenticated user's username
+ * @returns {string} - Path guaranteed to be within /<username>/
+ * @throws {AppError} - If filePath is the root "/" or username is missing
+ */
+/**
  * Helper function to stream media metadata images (cover art or thumbnails)
  */
 const streamMediaImage = async (req, res, imageType) => {
@@ -804,6 +838,32 @@ const respondWithOperation = (res, result, defaultStatus = 200) => {
 };
 
 
+
+/**
+/**
+ * Propagates the parent directory's existing permissions onto a newly created
+ * file or directory.  For group folders the parent already holds the correct
+ * member permissions (kept current by addMember/removeMember → updateMany),
+ * so copying parent → child is all that is needed at write time.
+ */
+async function applyGroupMemberPermissions(filePath) {
+    const parentPath = path.posix.dirname(filePath);
+    if (!parentPath || parentPath === filePath || parentPath === '.') return;
+
+    const parent = await File.findOne({ filePath: parentPath })
+        .select('permissions')
+        .lean();
+    if (!parent?.permissions) return;
+
+    const { read = [], write = [] } = parent.permissions;
+    if (!read.length && !write.length) return;
+
+    const update = {};
+    if (read.length)  update['permissions.read']  = { $each: read };
+    if (write.length) update['permissions.write'] = { $each: write };
+
+    await File.updateOne({ filePath }, { $addToSet: update });
+}
 
 /**
  * Simplified File Controller
@@ -1236,18 +1296,18 @@ const fileController = {
     }),
 
     /**
-     * @desc    Publish current file content as a version
-     * @route   POST /api/v1/files/:filePath/publish
+     * @desc    Save current file content as a new version
+     * @route   POST /api/v1/files/:filePath/versions
      * @access  Private (requires write permission)
      */
-    publishFileVersion: asyncHandler(async (req, res) => {
+    saveFileVersion: asyncHandler(async (req, res) => {
         const {filePath} = req.params;
         const decodedFilePath = decodeFilePath(filePath);
         const userId = getUserId(req);
         const userRoles = req.user?.roles || [];
         const {message} = req.body || {};
 
-        const result = await executeFileOperation('publish', {
+        const result = await executeFileOperation('saveVersion', {
             filePath: decodedFilePath,
             message
         }, userId, userRoles);
@@ -1339,14 +1399,21 @@ const fileController = {
      * @access  Private (requires authentication)
      */
     createFile: asyncHandler(async (req, res) => {
-        const {filePath, content = '', description = ''} = req.body;
+        const {filePath, content = '', description = '', overwrite = false} = req.body;
         if (!filePath) {
             throw new AppError('filePath is required', 400);
         }
 
-        const normalizedPath = decodeFilePath(filePath);
+        const normalizedPath = path.posix.normalize(decodeFilePath(filePath));
         const userId = getUserId(req);
         const userRoles = req.user?.roles || [];
+
+        if (!overwrite) {
+            const existing = await File.findOne({filePath: normalizedPath});
+            if (existing) {
+                throw new AppError('File already exists. Set overwrite=true to replace it.', 409);
+            }
+        }
 
         const result = await executeFileOperation('create', {
             filePath: normalizedPath,
@@ -1354,6 +1421,7 @@ const fileController = {
             message: description
         }, userId, userRoles);
 
+        await applyGroupMemberPermissions(normalizedPath).catch(() => {});
         respondWithOperation(res, result, 201);
     }),
 
@@ -1369,15 +1437,23 @@ const fileController = {
         }
 
         const decodedDirPath = decodeFilePath(dirPath);
-        const normalizedDirPath = decodedDirPath === '/' ? '/' : decodedDirPath.replace(/\/$/, '');
+        const normalizedDirPath = path.posix.normalize(
+            decodedDirPath.replace(/\/$/, '') || '/'
+        );
         const userId = getUserId(req);
         const userRoles = req.user?.roles || [];
+
+        const existing = await File.findOne({filePath: normalizedDirPath, type: 'directory'});
+        if (existing) {
+            throw new AppError('Directory already exists.', 409);
+        }
 
         const result = await executeFileOperation('createDir', {
             dirPath: normalizedDirPath,
             description
         }, userId, userRoles);
 
+        await applyGroupMemberPermissions(normalizedDirPath).catch(() => {});
         respondWithOperation(res, result, 201);
     }),
 
@@ -1613,19 +1689,26 @@ const fileController = {
         const userId = getUserId(req);
         const userRoles = req.user?.roles || [];
 
-        const {rootPath = '/', includeFiles = true, format = 'object'} = req.query;
+        const {rootPath = '/', includeFiles = true, format = 'object', access} = req.query;
+
+        // Build permission filter based on access level requested
+        const permissionFilter = access === 'write'
+            ? { $or: [{ owner: userId }, { 'permissions.write': userId }] }
+            : { $or: [{ owner: userId }, { 'permissions.read': userId }, { 'permissions.write': userId }] };
 
         // Build basic tree structure from database - include owned and shared files
-        const files = await File.find({
-            $or: [
-                { owner: userId },
-                { 'permissions.read': userId },
-                { 'permissions.write': userId }
-            ]
-        })
-            .select('filePath fileName type size createdAt parentPath')
+        // Include owner + permissions.write so we can compute a writable flag per node
+        const files = await File.find(permissionFilter)
+            .select('filePath fileName type size createdAt parentPath owner permissions.write')
             .sort({ filePath: 1 })
             .lean();
+
+        // Compute writable flag for each file: user owns it OR is in permissions.write
+        const userIdStr = userId.toString();
+        for (const file of files) {
+            file.writable = file.owner?.toString() === userIdStr
+                || (file.permissions?.write || []).some(id => id.toString() === userIdStr);
+        }
 
         // Build tree structure with array-based children (original format)
         const buildArrayTree = (parentPath = rootPath) => {
@@ -1634,8 +1717,9 @@ const fileController = {
                 filePath: file.filePath,
                 fileName: file.fileName,
                 type: file.type,
-                size: file.size || 0,
+                size: file.size,
                 createdAt: file.createdAt,
+                writable: file.writable,
                 children: file.type === 'directory' ? buildArrayTree(file.filePath) : undefined
             }));
         };
@@ -1651,8 +1735,9 @@ const fileController = {
                     filePath: file.filePath,
                     fileName: file.fileName,
                     type: file.type,
-                    size: file.size || 0,
+                    size: file.size,
                     createdAt: file.createdAt,
+                    writable: file.writable,
                     children: file.type === 'directory' ? buildObjectTree(file.filePath) : {}
                 };
             });
@@ -1664,7 +1749,7 @@ const fileController = {
         const useObjectFormat = format === 'object';
         const treeChildren = useObjectFormat ? buildObjectTree(rootPath) : buildArrayTree(rootPath);
 
-        const tree = useObjectFormat ? 
+        let tree = useObjectFormat ? 
             // Object format: return children directly as object
             treeChildren :
             // Array format: wrap in root node structure (backward compatibility)
@@ -1786,7 +1871,7 @@ const fileController = {
             const dirPath = req.query.filePath;
 
             // Check if directory exists (either owned or shared)
-            const directory = await File.findOne({
+            let directory = await File.findOne({
                 $and: [
                     { filePath: dirPath || '/' },
                     { type: 'directory' },
@@ -1800,7 +1885,9 @@ const fileController = {
                 ]
             });
 
-            if (!directory) {
+            // Root path is always accessible for any authenticated user (new users start with no files)
+            const isRootPath = !dirPath || dirPath === '/';
+            if (!directory && !isRootPath) {
                 return res.status(404).json({
                     success: false,
                     message: 'Directory not found or access denied'
@@ -1812,20 +1899,17 @@ const fileController = {
 
             const query = {
                 $and: [
-                    { parentPath: dirPath },
+                    {parentPath: dirPath},
                     {
                         $or: [
-                            { owner: userId },
-                            { 'permissions.read': userId },
-                            { 'permissions.write': userId }
+                            {owner: userId},
+                            {'permissions.read': userId},
+                            {'permissions.write': userId}
                         ]
-                    }
+                    },
+                    ...(fileType ? [{type: fileType}] : [])
                 ]
             };
-
-            if (fileType) {
-                query.$and.push({ type: fileType });
-            }
 
             const sort = {};
             // Sort directories first, then files
@@ -1841,16 +1925,16 @@ const fileController = {
                 success: true,
                 message: 'Directory contents retrieved successfully',
                 contents,
-                directory: {
+                directory: directory ? {
                     filePath: directory.filePath,
                     description: directory.description,
                     createdAt: directory.createdAt,
                     updatedAt: directory.updatedAt
-                },
+                } : { filePath: dirPath || '/' },
                 statistics: {
                     directories: contents.filter(item => item.type === 'directory').length,
                     files: contents.filter(item => item.type === 'file').length,
-                    totalSize: contents.reduce((sum, item) => sum + (item.size || 0), 0)
+                    totalSize: contents.reduce((sum, item) => sum + item.size, 0)
                 },
                 meta: {
                     count: contents.length,
@@ -1908,6 +1992,28 @@ const fileController = {
                     }
                 },
                 {
+                    // Compute total storage per document: working size + all saved version sizes
+                    $project: {
+                        type: 1,
+                        updatedAt: 1,
+                        createdAt: 1,
+                        fileSize: {
+                            $add: [
+                                { $ifNull: ['$size', 0] },
+                                {
+                                    $sum: {
+                                        $map: {
+                                            input: { $ifNull: ['$versionHistory', []] },
+                                            as: 'v',
+                                            in: { $ifNull: ['$$v.size', 0] }
+                                        }
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                },
+                {
                     $facet: {
                         // File type statistics including binary files
                         typeStats: [
@@ -1915,10 +2021,10 @@ const fileController = {
                                 $group: {
                                     _id: '$type',
                                     count: { $sum: 1 },
-                                    totalSize: { $sum: '$size' },
-                                    avgSize: { $avg: '$size' },
-                                    maxSize: { $max: '$size' },
-                                    minSize: { $min: '$size' }
+                                    totalSize: { $sum: '$fileSize' },
+                                    avgSize: { $avg: '$fileSize' },
+                                    maxSize: { $max: '$fileSize' },
+                                    minSize: { $min: '$fileSize' }
                                 }
                             }
                         ],
@@ -2227,18 +2333,28 @@ const fileController = {
                                     }
                                 }
                             ],
-                            // Size statistics for files only
+                            // Size statistics for files only (includes version history sizes)
                             sizeStats: [
                                 {
                                     $match: { type: { $ne: 'directory' } }
                                 },
                                 {
+                                    $addFields: {
+                                        fileSize: {
+                                            $add: [
+                                                { $ifNull: ['$size', 0] },
+                                                { $sum: { $map: { input: { $ifNull: ['$versionHistory', []] }, as: 'v', in: { $ifNull: ['$$v.size', 0] } } } }
+                                            ]
+                                        }
+                                    }
+                                },
+                                {
                                     $group: {
                                         _id: null,
-                                        totalSize: { $sum: '$size' },
-                                        avgSize: { $avg: '$size' },
-                                        maxSize: { $max: '$size' },
-                                        minSize: { $min: '$size' }
+                                        totalSize: { $sum: '$fileSize' },
+                                        avgSize: { $avg: '$fileSize' },
+                                        maxSize: { $max: '$fileSize' },
+                                        minSize: { $min: '$fileSize' }
                                     }
                                 }
                             ]
@@ -2281,6 +2397,17 @@ const fileController = {
             // Admin comprehensive statistics with consolidated aggregation
             const adminStats = await File.aggregate([
                 {
+                    // Pre-compute fileSize = base size + all saved version sizes
+                    $addFields: {
+                        fileSize: {
+                            $add: [
+                                { $ifNull: ['$size', 0] },
+                                { $sum: { $map: { input: { $ifNull: ['$versionHistory', []] }, as: 'v', in: { $ifNull: ['$$v.size', 0] } } } }
+                            ]
+                        }
+                    }
+                },
+                {
                     $facet: {
                         // Overall counts and size stats
                         overview: [
@@ -2288,10 +2415,10 @@ const fileController = {
                                 $group: {
                                     _id: '$type',
                                     count: { $sum: 1 },
-                                    totalSize: { $sum: '$size' },
-                                    avgSize: { $avg: '$size' },
-                                    maxSize: { $max: '$size' },
-                                    minSize: { $min: '$size' }
+                                    totalSize: { $sum: '$fileSize' },
+                                    avgSize: { $avg: '$fileSize' },
+                                    maxSize: { $max: '$fileSize' },
+                                    minSize: { $min: '$fileSize' }
                                 }
                             }
                         ],
@@ -2304,7 +2431,7 @@ const fileController = {
                                 $group: {
                                     _id: '$mimeType',
                                     count: { $sum: 1 },
-                                    totalSize: { $sum: '$size' }
+                                    totalSize: { $sum: '$fileSize' }
                                 }
                             },
                             { $sort: { count: -1 } },
@@ -2316,7 +2443,7 @@ const fileController = {
                                 $group: {
                                     _id: '$owner',
                                     fileCount: { $sum: 1 },
-                                    totalSize: { $sum: '$size' }
+                                    totalSize: { $sum: '$fileSize' }
                                 }
                             },
                             { $sort: { fileCount: -1 } },
@@ -2383,7 +2510,7 @@ const fileController = {
                                     compressedFiles: {
                                         $sum: { $cond: ['$isCompressed', 1, 0] }
                                     },
-                                    totalStorageUsed: { $sum: '$size' },
+                                    totalStorageUsed: { $sum: '$fileSize' },
                                     totalOriginalSize: { $sum: '$originalSize' },
                                     totalSpaceSaved: {
                                         $sum: { $subtract: ['$originalSize', '$size'] }
@@ -2567,6 +2694,29 @@ const fileController = {
                 });
             }
 
+            // Enforce connection restriction: every target user must be connected to the file owner
+            const userIdsForCheck = Array.isArray(userIds) ? userIds : [userIds];
+            const nonConnected = [];
+            await Promise.all(userIdsForCheck.map(async (targetId) => {
+                const isConnected = await Connection.exists({
+                    $or: [
+                        {requester: userId, recipient: targetId},
+                        {requester: targetId, recipient: userId}
+                    ],
+                    status: 'accepted'
+                });
+                if (!isConnected) {
+                    nonConnected.push(targetId);
+                }
+            }));
+
+            if (nonConnected.length > 0) {
+                return res.status(403).json({
+                    success: false,
+                    message: 'Files can only be shared with your connections'
+                });
+            }
+
             // Share the file with permission propagation
             try {
                 await file.shareWithUsers(userIds, permission);
@@ -2587,6 +2737,13 @@ const fileController = {
                         });
                     }
                 }));
+
+                // If this is a directory, all child sharing caches are now stale too —
+                // sweep them with a single pattern delete rather than iterating children.
+                if (file.type === 'directory') {
+                    const encodedDirPrefix = encodeURIComponent(decodedFilePath + '/');
+                    await cache.delPattern(`file:sharing:${encodedDirPrefix}*`);
+                }
 
                 // Populate shared users for response
                 await file.populate('permissions.read permissions.write', 'firstName lastName username email');
@@ -2715,6 +2872,16 @@ const fileController = {
                 file.removeUsersFromPermissions(userIds, permission, userId);
                 await file.save();
 
+                // If it's a directory, cascade permission removal to all children
+                if (file.type === 'directory') {
+                    await File.removePermissionsFromChildren(decodedFilePath, userIdsArray, permission);
+                    // Sweep all child file:sharing caches in one pattern delete
+                    const encodedDirPrefix = encodeURIComponent(decodedFilePath + '/');
+                    await cache.delPattern(`file:sharing:${encodedDirPrefix}*`);
+                }
+
+                // Clean up parent directory read permissions that are no longer needed
+                await File.cleanupParentPermissions(decodedFilePath, userIdsArray);
                 // Invalidate related caches for owner and affected users
                 await cache.invalidateAllRelatedCaches('file', decodedFilePath, userId);
                 await Promise.all(userIdsArray.map(async (affectedUserId) => {
@@ -2870,9 +3037,25 @@ const fileController = {
             description = '',
             tags = [],
             permissions = {},
-            basePath = '/uploads',
+            basePath,
             overwrite = false
         } = req.body;
+
+        // Normalise to eliminate any .. traversal. Permission guards below gate access.
+        const effectiveBasePath = path.posix.normalize(basePath || ('/' + req.user.username));
+
+        // Guard: user must have write access to the upload destination.
+        const uploadDestWritable = await File.findOneWithWritePermission(
+            { filePath: effectiveBasePath, type: 'directory' },
+            userId, userRoles
+        );
+        if (!uploadDestWritable) {
+            const uploadDestExists = await File.exists({ filePath: effectiveBasePath, type: 'directory' });
+            if (uploadDestExists) {
+                throw new AppError('You do not have write permission in the upload destination', 403);
+            }
+            // Destination doesn't exist yet — ensureParentDirs will create it under this user.
+        }
 
         // Standardized input parsing
         const parsedTags = Array.isArray(tags) ? tags : 
@@ -2889,22 +3072,39 @@ const fileController = {
             }
         }
 
+        // Parse explicit relative paths sent by the client (folder uploads)
+        const parsedRelativePaths = (() => {
+            try { return req.body.relativePaths ? JSON.parse(req.body.relativePaths) : null; }
+            catch { return null; }
+        })();
+
+        logger.info('Upload request received', {
+            userId,
+            fileCount: req.files.length,
+            basePath: effectiveBasePath,
+            hasRelativePaths: !!parsedRelativePaths,
+            relativePathCount: parsedRelativePaths?.length,
+            sampleOriginalnames: req.files.slice(0, 3).map(f => f.originalname),
+            sampleRelativePaths: parsedRelativePaths?.slice(0, 3)
+        });
+
         // Process files
         const uploadedFiles = [];
         const errors = [];
 
-        for (const uploadedFile of req.files) {
+        for (let i = 0; i < req.files.length; i++) {
+            const uploadedFile = req.files[i];
             try {
-                // Standardized path construction with Unicode normalization (NFC)
-                // This prevents URL encoding issues with accented characters
-                const normalizedFilename = uploadedFile.originalname.normalize('NFC');
-                const filePath = path.posix.join(basePath, normalizedFilename);
-                const fileType = File.getFileType(normalizedFilename);
+                // Use explicit relative path from client if available (preserves folder structure)
+                const rawRelativePath = parsedRelativePaths?.[i] || uploadedFile.originalname;
+                const normalizedFilename = rawRelativePath.normalize('NFC');
+                const fileName = path.posix.basename(normalizedFilename);
+                const filePath = path.posix.join(effectiveBasePath, normalizedFilename);
+                const fileType = File.getFileType(fileName);
 
-                // Check if file already exists
+                // Check if file already exists (filePath is globally unique)
                 const existingFile = await File.findOne({
-                    filePath,
-                    owner: userId
+                    filePath
                 });
 
                 if (existingFile && !overwrite) {
@@ -2961,19 +3161,22 @@ const fileController = {
                         file = await existingFile.save();
                     }
                 } else {
-                    // Ensure parent directories exist
-                    await ensureParentDirs(filePath, userId);
+                    // Ensure parent directories exist (returns resolved workspace owner)
+                    const uploadOwnerId = await ensureParentDirs(filePath, userId);
+                    const uploadIsGuest = String(uploadOwnerId) !== String(userId);
                     
                     // Create new file with normalized filename
                     file = await File.create({
                         filePath,
-                        fileName: normalizedFilename,
+                        fileName,
                         type: fileType,
                         mimeType: uploadedFile.mimetype,
-                        description: description || `Uploaded file: ${normalizedFilename}`,
+                        description: description || `Uploaded file: ${fileName}`,
                         tags: parsedTags || [],
-                        permissions: parsedPermissions || { read: [], write: [] },
-                        owner: userId,
+                        permissions: uploadIsGuest
+                            ? { read: [userId], write: [userId] }
+                            : (parsedPermissions || { read: [], write: [] }),
+                        owner: uploadOwnerId,
                         lastModifiedBy: userId,
                         size: uploadedFile.buffer.length
                     });
@@ -3052,6 +3255,7 @@ const fileController = {
 
                 await file.populate('owner lastModifiedBy', 'firstName lastName username email');
                 uploadedFiles.push(file);
+                await applyGroupMemberPermissions(file.filePath).catch(() => {});
 
                 logger.info('File uploaded successfully', {
                     fileName: uploadedFile.originalname,
@@ -3098,9 +3302,454 @@ const fileController = {
         res.status(201).json(response);
     }),
 
+    /**
+     * Extract a zip file into a target directory
+     * POST /api/v1/files/extract-zip
+     * Body: { filePath, targetPath }
+     */
+    extractZip: asyncHandler(async (req, res) => {
+        const userId = getUserId(req);
+        const userRoles = req.user?.roles || [];
+        const { filePath: zipFilePath, targetPath = '/' } = req.body;
 
+        if (!zipFilePath) {
+            throw new AppError('filePath is required', 400);
+        }
+
+        const normalizedZipPath = normalizeFilePath(zipFilePath);
+        const normalizedTargetPath = normalizeFilePath(targetPath);
+
+        // Find the zip file and verify read permission
+        const zipFile = await File.findOneWithReadPermission(
+            { filePath: normalizedZipPath },
+            userId,
+            userRoles
+        );
+
+        if (!zipFile) {
+            throw new AppError('Zip file not found or insufficient permissions', 404);
+        }
+
+        if (zipFile.type !== 'binary') {
+            throw new AppError('File is not a binary file', 400);
+        }
+
+        // Retrieve the zip content from GridFS
+        const zipBuffer = await getAndDecompress(zipFile);
+        if (!zipBuffer || zipBuffer.length === 0) {
+            throw new AppError('Zip file is empty', 400);
+        }
+
+        let zip;
+        try {
+            zip = await JSZip.loadAsync(zipBuffer);
+        } catch (err) {
+            throw new AppError('Failed to read zip file. It may be corrupted or not a valid zip archive.', 400);
+        }
+
+        const extracted = [];
+        const errors = [];
+
+        // Always extract into a folder named after the zip file
+        const zipName = path.posix.basename(normalizedZipPath).replace(/\.zip$/i, '');
+        const allZipEntries = Object.keys(zip.files).filter(p => !p.startsWith('__MACOSX/') && !p.includes('/.'));
+        const effectiveTargetPath = path.posix.join(normalizedTargetPath, zipName);
+
+        logger.info('Zip extraction starting', {
+            userId,
+            zipPath: normalizedZipPath,
+            targetPath: normalizedTargetPath,
+            entryCount: allZipEntries.length,
+            effectiveTargetPath
+        });
+
+        for (const [relativePath, zipEntry] of Object.entries(zip.files)) {
+            // Skip macOS resource forks and hidden metadata
+            if (relativePath.startsWith('__MACOSX/') || relativePath.includes('/.')) continue;
+
+            const entryPath = path.posix.join(effectiveTargetPath, relativePath);
+
+            try {
+                if (zipEntry.dir) {
+                    // Create directory — ensureParentDirs resolves workspace owner
+                    const zipDirOwnerId = await ensureParentDirs(entryPath + '/placeholder', userId);
+                    await File.findOneAndUpdate(
+                        { filePath: entryPath, type: 'directory' },
+                        { $setOnInsert: {
+                            filePath: entryPath,
+                            fileName: path.posix.basename(entryPath),
+                            type: 'directory',
+                            mimeType: 'application/x-directory',
+                            parentPath: path.posix.dirname(entryPath),
+                            depth: entryPath.split('/').filter(Boolean).length,
+                            description: `Extracted directory: ${path.posix.basename(entryPath)}`,
+                            owner: zipDirOwnerId,
+                            lastModifiedBy: userId,
+                            permissions: { read: [], write: [] },
+                            size: 0
+                        }},
+                        { upsert: true, setDefaultsOnInsert: false }
+                    );
+                    extracted.push({ filePath: entryPath, type: 'directory' });
+                } else {
+                    // Extract file
+                    const buffer = await zipEntry.async('nodebuffer');
+                    const fileName = path.posix.basename(entryPath);
+                    const fileType = File.getFileType(fileName);
+
+                    const extractOwnerId = await ensureParentDirs(entryPath, userId);
+
+                    const existingFile = await File.findOne({ filePath: entryPath });
+                    if (existingFile) {
+                        // Overwrite existing file
+                        if (existingFile.type === 'text') {
+                            const textContent = buffer.toString('utf8');
+                            await yjsService.initializeTextContent(entryPath, textContent);
+                            existingFile.size = buffer.length;
+                            existingFile.lastModifiedBy = userId;
+                            await existingFile.save();
+                        } else {
+                            await existingFile.setContent(buffer);
+                            existingFile.size = buffer.length;
+                            existingFile.lastModifiedBy = userId;
+                            await existingFile.save();
+                        }
+                    } else {
+                        const extractIsGuest = String(extractOwnerId) !== String(userId);
+                        const newFile = await File.create({
+                            filePath: entryPath,
+                            fileName,
+                            type: fileType,
+                            mimeType: 'application/octet-stream',
+                            description: `Extracted from: ${path.posix.basename(normalizedZipPath)}`,
+                            owner: extractOwnerId,
+                            lastModifiedBy: userId,
+                            permissions: extractIsGuest
+                                ? { read: [userId], write: [userId] }
+                                : { read: [], write: [] },
+                            size: buffer.length
+                        });
+
+                        if (newFile.type === 'text') {
+                            const textContent = buffer.toString('utf8');
+                            if (textContent.trim()) {
+                                await yjsService.initializeTextContent(entryPath, textContent);
+                            }
+                        } else {
+                            await newFile.setContent(buffer);
+                        }
+                    }
+                    extracted.push({ filePath: entryPath, type: fileType });
+                }
+            } catch (err) {
+                logger.error('Failed to extract zip entry', { entryPath, error: err.message });
+                errors.push({ filePath: entryPath, error: err.message });
+            }
+        }
+
+        const response = {
+            success: true,
+            message: `Extracted ${extracted.length} item(s) from ${path.posix.basename(normalizedZipPath)}`,
+            extracted,
+            targetPath: effectiveTargetPath
+        };
+
+        if (errors.length > 0) {
+            response.message += ` (${errors.length} failed)`;
+            response.errors = errors;
+        }
+
+        res.status(200).json(response);
+    }),
+
+    // =========================================================================
+    // COMMENT OPERATIONS
+    // =========================================================================
+
+    /**
+     * @desc    Create a comment on a file
+     * @route   POST /api/v1/comments
+     * @access  Authenticated (must have read access to the file)
+     */
+    createComment: asyncHandler(async (req, res, next) => {
+        const {fileId, body, parentComment, groupId} = req.body;
+        const userId = req.user.id;
+
+        // Verify file exists
+        const file = await File.findById(fileId).select('_id owner permissions');
+        if (!file) {
+            return next(new AppError('File not found', 404));
+        }
+
+        // If groupId is provided, verify the user is a member of that group
+        // and that the file is shared in that group
+        if (groupId) {
+            const group = await Group.findById(groupId).select('members files');
+            if (!group) {
+                return next(new AppError('Group not found', 404));
+            }
+            if (!group.isMember(userId)) {
+                return next(new AppError('You must be a group member to comment', 403));
+            }
+            const fileInGroup = group.files.some(f => f.file.equals(fileId));
+            if (!fileInGroup) {
+                return next(new AppError('This file is not shared in this group', 400));
+            }
+        } else {
+            // Direct file comment: user must be owner or have read permission
+            const isOwner = file.owner.equals(userId);
+            const hasRead = file.permissions?.read?.some(id => id.equals(userId));
+            const hasWrite = file.permissions?.write?.some(id => id.equals(userId));
+            const isAdmin = hasRight(req.user.roles, RIGHTS.MANAGE_ALL_CONTENT);
+
+            if (!isOwner && !hasRead && !hasWrite && !isAdmin) {
+                return next(new AppError('You do not have access to comment on this file', 403));
+            }
+        }
+
+        // If replying, verify parent comment exists and is on the same file
+        if (parentComment) {
+            const parent = await Comment.findById(parentComment).select('file deleted');
+            if (!parent || parent.deleted) {
+                return next(new AppError('Parent comment not found', 404));
+            }
+            if (!parent.file.equals(fileId)) {
+                return next(new AppError('Parent comment does not belong to this file', 400));
+            }
+        }
+
+        const comment = await Comment.create({
+            file: fileId,
+            author: userId,
+            body: sanitizeHtmlInput(body),
+            parentComment: parentComment || null,
+            group: groupId || null
+        });
+
+        await comment.populate('author', 'firstName lastName username profilePhoto');
+        await cache.del(`comments:file:${fileId}`);
+
+        logger.info(`[Comment] Comment created on file ${fileId} by ${userId}`);
+
+        res.status(201).json({
+            success: true,
+            data: comment
+        });
+    }),
+
+    /**
+     * @desc    Get comments for a file
+     * @route   GET /api/v1/comments/file/:fileId
+     * @access  Authenticated (must have read access)
+     */
+    getFileComments: asyncHandler(async (req, res) => {
+        const {fileId} = req.params;
+        const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+        const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 20));
+        const skip = (page - 1) * limit;
+        const groupId = req.query.groupId || null;
+
+        // Build filter: top-level comments only (no parentComment)
+        const filter = {file: fileId, parentComment: null, deleted: false};
+        if (groupId) {
+            filter.group = groupId;
+        }
+
+        const [comments, total] = await Promise.all([
+            Comment.find(filter)
+                .sort({createdAt: -1})
+                .skip(skip)
+                .limit(limit)
+                .populate('author', 'firstName lastName username profilePhoto'),
+            Comment.countDocuments(filter)
+        ]);
+
+        // Fetch reply counts for each top-level comment
+        const commentIds = comments.map(c => c._id);
+        const replyCounts = await Comment.aggregate([
+            {$match: {parentComment: {$in: commentIds}, deleted: false}},
+            {$group: {_id: '$parentComment', count: {$sum: 1}}}
+        ]);
+        const replyMap = new Map(replyCounts.map(r => [r._id.toString(), r.count]));
+
+        const data = comments.map(c => ({
+            ...c.toObject(),
+            replyCount: replyMap.get(c._id.toString()) || 0
+        }));
+
+        res.status(200).json({
+            success: true,
+            data,
+            pagination: {page, limit, total, pages: Math.ceil(total / limit)}
+        });
+    }),
+
+    /**
+     * @desc    Get replies to a comment
+     * @route   GET /api/v1/comments/:commentId/replies
+     * @access  Authenticated
+     */
+    getReplies: asyncHandler(async (req, res) => {
+        const {commentId} = req.params;
+        const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+        const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 20));
+        const skip = (page - 1) * limit;
+
+        const filter = {parentComment: commentId, deleted: false};
+
+        const [replies, total] = await Promise.all([
+            Comment.find(filter)
+                .sort({createdAt: 1})
+                .skip(skip)
+                .limit(limit)
+                .populate('author', 'firstName lastName username profilePhoto'),
+            Comment.countDocuments(filter)
+        ]);
+
+        res.status(200).json({
+            success: true,
+            data: replies,
+            pagination: {page, limit, total, pages: Math.ceil(total / limit)}
+        });
+    }),
+
+    /**
+     * @desc    Update a comment
+     * @route   PATCH /api/v1/comments/:commentId
+     * @access  Comment author only
+     */
+    updateComment: asyncHandler(async (req, res, next) => {
+        const {commentId} = req.params;
+        const {body} = req.body;
+        const userId = req.user.id;
+
+        const comment = await Comment.findById(commentId);
+        if (!comment || comment.deleted) {
+            return next(new AppError('Comment not found', 404));
+        }
+
+        if (!comment.author.equals(userId)) {
+            return next(new AppError('You can only edit your own comments', 403));
+        }
+
+        comment.body = sanitizeHtmlInput(body);
+        comment.editedAt = new Date();
+        await comment.save();
+
+        await comment.populate('author', 'firstName lastName username profilePhoto');
+        await cache.del(`comments:file:${comment.file}`);
+
+        res.status(200).json({
+            success: true,
+            data: comment
+        });
+    }),
+
+    /**
+     * @desc    Delete a comment (soft delete)
+     * @route   DELETE /api/v1/comments/:commentId
+     * @access  Comment author, file owner, or system admin
+     */
+    deleteComment: asyncHandler(async (req, res, next) => {
+        const {commentId} = req.params;
+        const userId = req.user.id;
+
+        const comment = await Comment.findById(commentId);
+        if (!comment || comment.deleted) {
+            return next(new AppError('Comment not found', 404));
+        }
+
+        const isAuthor = comment.author.equals(userId);
+        const isAdmin = hasRight(req.user.roles, RIGHTS.MANAGE_ALL_CONTENT);
+
+        // Also allow file owner to delete comments on their files
+        let isFileOwner = false;
+        if (!isAuthor && !isAdmin) {
+            const file = await File.findById(comment.file).select('owner');
+            if (file) {
+                isFileOwner = file.owner.equals(userId);
+            }
+        }
+
+        if (!isAuthor && !isAdmin && !isFileOwner) {
+            return next(new AppError('You do not have permission to delete this comment', 403));
+        }
+
+        comment.deleted = true;
+        comment.body = '[deleted]';
+        await comment.save();
+
+        await cache.del(`comments:file:${comment.file}`);
+
+        res.status(200).json({
+            success: true,
+            message: 'Comment deleted'
+        });
+    }),
+
+    /**
+     * @desc    Get comment count for a file
+     * @route   GET /api/v1/comments/file/:fileId/count
+     * @access  Authenticated
+     */
+    getCommentCount: asyncHandler(async (req, res) => {
+        const {fileId} = req.params;
+        const groupId = req.query.groupId || null;
+
+        const filter = {file: fileId, deleted: false};
+        if (groupId) filter.group = groupId;
+
+        const count = await Comment.countDocuments(filter);
+
+        res.status(200).json({
+            success: true,
+            data: {count}
+        });
+    }),
 
 };
+
+// Cascade-update all descendants when a directory path changes (rename or move)
+async function cascadeChildPaths(oldDirPath, newDirPath) {
+    // Find ALL files under the old path regardless of owner — when a directory
+    // is moved by any user with write access, every child (including those owned
+    // by other collaborators) must have its path updated.
+    const children = await File.find({
+        filePath: { $regex: `^${oldDirPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/` }
+    });
+
+    for (const child of children) {
+        const oldChildPath = child.filePath;
+        const newChildPath = newDirPath + oldChildPath.slice(oldDirPath.length);
+
+        // Migrate GridFS metadata for binary files
+        if (child.type === 'binary' && child.gridFSId) {
+            try {
+                await renameInGridFS(oldChildPath, newChildPath);
+            } catch (err) {
+                logger.error('Failed to rename child in GridFS during cascade:', {
+                    error: err.message, oldChildPath, newChildPath
+                });
+            }
+        }
+
+        // Migrate Yjs collaborative document for text files
+        if (child.type === 'text') {
+            try {
+                await yjsService.moveDocument(oldChildPath, newChildPath);
+            } catch (err) {
+                logger.error('Failed to migrate Yjs child during cascade:', {
+                    error: err.message, oldChildPath, newChildPath
+                });
+            }
+        }
+
+        child.filePath = newChildPath;
+        await child.save(); // pre-save hook recalculates fileName, parentPath, depth
+    }
+
+    return children.length;
+}
 
 async function executeFileOperation(operation, data, userId, userRoles = []) {
     
@@ -3229,19 +3878,13 @@ async function executeFileOperation(operation, data, userId, userRoles = []) {
                 // Only use metaFile.updatedAt for consistent, non-interfering metadata display
                 const effectiveUpdatedAt = metaFile.updatedAt;
                 
-                // Calculate real-time size for text files from Yjs document
-                let size = metaFile.size;
-                if (metaFile.type === 'text') {
-                    try {
-                        const yjsContent = await yjsService.getTextContent(effectiveFilePath);
-                        if (yjsContent) {
-                            size = Buffer.byteLength(yjsContent, 'utf8');
-                        }
-                    } catch (error) {
-                        // If Yjs content not available, fall back to stored size
-                        logger.warn(`Could not get Yjs content size for ${effectiveFilePath}:`, error.message);
-                    }
-                }
+                // Use stored size directly — computing live Yjs byte-length loads the
+                // entire document from MongoDB on every metadata request, which is the
+                // main reason the file viewer takes seconds to open.  The stored size
+                // is updated by the 3-second metadata debounce in bindState anyway.
+                // Add version storage: sum all saved version sizes on top of the working file size.
+                const versionStorageSize = metaFile.versionHistory.reduce((sum, v) => sum + (v.size || 0), 0);
+                const size = metaFile.size + versionStorageSize;
                 
                 const metadataResult = {
                     success: true,
@@ -3257,7 +3900,7 @@ async function executeFileOperation(operation, data, userId, userRoles = []) {
                     description: metaFile.description,
                     permissions: metaFile.permissions,
                     version: metaFile.version,
-                    versionHistory: metaFile.versionHistory || [],
+                    versionHistory: metaFile.versionHistory,
                     createdAt: metaFile.createdAt,
                     updatedAt: effectiveUpdatedAt, // Use enhanced last modified time
                     lastModifiedBy: metaFile.lastModifiedBy,
@@ -3325,7 +3968,7 @@ async function executeFileOperation(operation, data, userId, userRoles = []) {
                             description: updatedFile.description,
                             permissions: updatedFile.permissions,
                             version: updatedFile.version,
-                            versionHistory: updatedFile.versionHistory || [],
+                            versionHistory: updatedFile.versionHistory,
                             createdAt: updatedFile.createdAt,
                             updatedAt: updatedFile.updatedAt,
                             lastModifiedBy: updatedFile.lastModifiedBy
@@ -3349,7 +3992,7 @@ async function executeFileOperation(operation, data, userId, userRoles = []) {
                             description: updateFile.description,
                             permissions: updateFile.permissions,
                             version: updateFile.version,
-                            versionHistory: updateFile.versionHistory || [],
+                            versionHistory: updateFile.versionHistory,
                             createdAt: updateFile.createdAt,
                             updatedAt: updateFile.updatedAt,
                             lastModifiedBy: updateFile.lastModifiedBy
@@ -3358,21 +4001,21 @@ async function executeFileOperation(operation, data, userId, userRoles = []) {
                     };
                 }
                 
-            case 'publish':
+            case 'saveVersion':
                 // Create a version snapshot directly from existing file content
-                // Publish should work independently without requiring a save operation
-                const pubFile = await File.findOneWithWritePermission(
+                // Version saving works independently without requiring an HTTP content update
+                const versionFile = await File.findOneWithWritePermission(
                     {filePath: effectiveFilePath},
                     userId,
                     userRoles
                 );
                 
-                if (!pubFile) {
+                if (!versionFile) {
                     throw new Error('File not found or insufficient permissions');
                 }
                 
-                const publishMessage = message || `Published at ${new Date().toLocaleString()}`;
-                const updatedFile = await pubFile.createVersionSnapshot(userId, publishMessage, (path) => yjsService.getTextContent(path));
+                const versionMessage = message || `Saved at ${new Date().toLocaleString()}`;
+                const updatedFile = await versionFile.createVersionSnapshot(userId, versionMessage, (path) => yjsService.getTextContent(path));
                 
                 const totalVersions = updatedFile.versionHistory.length;
                 // Latest version number is last index + 1 (sequential numbering)
@@ -3380,8 +4023,8 @@ async function executeFileOperation(operation, data, userId, userRoles = []) {
                 
                 return { 
                     success: true, 
-                    operation: 'publish',
-                    message: `Version ${versionNumber} published successfully`,
+                    operation: 'saveVersion',
+                    message: `Version ${versionNumber} saved successfully`,
                     versionNumber: versionNumber, // Latest version is always 1
                     versionCount: totalVersions,
                     filePath: effectiveFilePath,
@@ -3420,16 +4063,40 @@ async function executeFileOperation(operation, data, userId, userRoles = []) {
                 };
                 
             case 'create':
+                // Guard: user must have write access to the immediate parent directory.
+                const createParentPath = path.posix.dirname(effectiveFilePath);
+                const createParentWritable = await File.findOneWithWritePermission(
+                    { filePath: createParentPath, type: 'directory' },
+                    userId, userRoles
+                );
+                if (!createParentWritable) {
+                    const createParentExists = await File.exists({ filePath: createParentPath, type: 'directory' });
+                    if (createParentExists) {
+                        return {
+                            success: false,
+                            error: 'You do not have write permission in the destination directory',
+                            statusCode: 403
+                        };
+                    }
+                }
+
+                // Ensure parent directories exist (returns resolved workspace owner)
+                const createOwnerId = await ensureParentDirs(effectiveFilePath, userId);
+                const createIsGuest = String(createOwnerId) !== String(userId);
+
                 // Create new file (content is optional - empty files are allowed)
                 const createFileData = {
                     filePath: effectiveFilePath,
-                    type: 'text', // Use correct field name and proper type for text files
+                    type: 'text',
                     description: message || 'Created via API request',
-                    owner: userId
+                    owner: createOwnerId,
+                    ...(createIsGuest && {
+                        permissions: {
+                            read: [userId],
+                            write: [userId]
+                        }
+                    })
                 };
-                
-                // Ensure parent directories exist
-                await ensureParentDirs(effectiveFilePath, userId);
                 
                 const newFile = await File.create(createFileData);
                 
@@ -3473,15 +4140,40 @@ async function executeFileOperation(operation, data, userId, userRoles = []) {
                 
                 // Use directory path directly (no decoding needed for WebSocket)
                 const normalizedDirPath = dirPath.replace(/\/$/, '') || '/';
-                
-                // Ensure parent directories exist
-                await ensureParentDirs(normalizedDirPath, userId);
+
+                // Guard: user must have write access to the immediate parent directory
+                const createDirParentPath = path.posix.dirname(normalizedDirPath);
+                const createDirParentWritable = await File.findOneWithWritePermission(
+                    { filePath: createDirParentPath, type: 'directory' },
+                    userId, userRoles
+                );
+                if (!createDirParentWritable) {
+                    const createDirParentExists = await File.exists({ filePath: createDirParentPath, type: 'directory' });
+                    if (createDirParentExists) {
+                        return {
+                            success: false,
+                            error: 'You do not have write permission in the destination directory',
+                            statusCode: 403
+                        };
+                    }
+                }
+
+                // Ensure parent directories exist (resolves workspace owner internally)
+                const dirOwnerId = await ensureParentDirs(normalizedDirPath, userId);
+                const dirIsGuest = String(dirOwnerId) !== String(userId);
                 
                 const createDirData = {
                     filePath: normalizedDirPath,
+                    fileName: path.posix.basename(normalizedDirPath),
                     type: 'directory',
                     description: data.description || 'Created via API request',
-                    owner: userId
+                    owner: dirOwnerId,
+                    ...(dirIsGuest && {
+                        permissions: {
+                            read: [userId],
+                            write: [userId]
+                        }
+                    })
                 };
                 
                 const newDir = await File.create(createDirData);
@@ -3623,9 +4315,25 @@ async function executeFileOperation(operation, data, userId, userRoles = []) {
                     throw new Error('Source file not found or insufficient permissions');
                 }
                 
-                // Destination is always a directory - combine with source filename
-                const sourceFileName = moveFile.fileName;
-                const newFilePath = `${destinationPath}/${sourceFileName}`;
+                // destinationPath is the full target path (directory + filename) sent by the client
+                const newFilePath = destinationPath;
+
+                // Guard: user must have write access to the destination parent directory
+                const moveDestParentPath = path.posix.dirname(newFilePath);
+                const moveDestParentWritable = await File.findOneWithWritePermission(
+                    { filePath: moveDestParentPath, type: 'directory' },
+                    userId, userRoles
+                );
+                if (!moveDestParentWritable) {
+                    const moveDestParentExists = await File.exists({ filePath: moveDestParentPath, type: 'directory' });
+                    if (moveDestParentExists) {
+                        return {
+                            success: false,
+                            error: 'You do not have write permission in the destination directory',
+                            statusCode: 403
+                        };
+                    }
+                }
                 
                 // For text files, capture Yjs snapshot before path change
                 let yjsBeforeMove = null;
@@ -3640,7 +4348,9 @@ async function executeFileOperation(operation, data, userId, userRoles = []) {
                 }
 
                 // Ensure parent directories exist for the new path
-                await ensureParentDirs(newFilePath, userId);
+                // Resolve destination workspace owner — if moving across workspaces,
+                // the file should become owned by the destination workspace user.
+                const moveOwnerId = await ensureParentDirs(newFilePath, userId);
                 
                 // For binary files, rename in GridFS before updating the database record
                 if (moveFile.type === 'binary' && moveFile.gridFSId) {
@@ -3652,9 +4362,28 @@ async function executeFileOperation(operation, data, userId, userRoles = []) {
                     }
                 }
                 
-                // Update the file path - fileName and parentPath will be auto-calculated by the model
+                // Update the file path, owner, and last modifier
                 moveFile.filePath = newFilePath;
+                moveFile.owner = moveOwnerId;
+                moveFile.lastModifiedBy = userId;
+                // Ensure the actor keeps read+write access after the move
+                if (String(moveOwnerId) !== String(userId)) {
+                    if (!moveFile.permissions.read.some(id => String(id) === String(userId))) {
+                        moveFile.permissions.read.push(userId);
+                    }
+                    if (!moveFile.permissions.write.some(id => String(id) === String(userId))) {
+                        moveFile.permissions.write.push(userId);
+                    }
+                }
                 await moveFile.save();
+
+                // For directories, cascade-update all children regardless of owner
+                if (moveFile.type === 'directory') {
+                    const childCount = await cascadeChildPaths(sourcePath, newFilePath);
+                    if (childCount > 0) {
+                        logger.info('Cascaded move to children', { oldPath: sourcePath, newPath: newFilePath, childCount });
+                    }
+                }
 
                 // For text files, migrate Yjs doc and active sessions from old path to new path
                 if (moveFile.type === 'text') {
@@ -3742,9 +4471,29 @@ async function executeFileOperation(operation, data, userId, userRoles = []) {
                     throw new Error('Source file not found or insufficient permissions');
                 }
                 
-                // Destination is always a directory - combine with source filename
-                const copySourceFileName = copyFile.fileName;
-                const copyNewFilePath = `${destinationPath}/${copySourceFileName}`;
+                // destinationPath is the full target path (directory + filename) sent by the client
+                const copyNewFilePath = destinationPath;
+
+                // Guard: user must have write access to the destination parent directory
+                const copyDestParentPath = path.posix.dirname(copyNewFilePath);
+                const copyDestParentWritable = await File.findOneWithWritePermission(
+                    { filePath: copyDestParentPath, type: 'directory' },
+                    userId, userRoles
+                );
+                if (!copyDestParentWritable) {
+                    const copyDestParentExists = await File.exists({ filePath: copyDestParentPath, type: 'directory' });
+                    if (copyDestParentExists) {
+                        return {
+                            success: false,
+                            error: 'You do not have write permission in the destination directory',
+                            statusCode: 403
+                        };
+                    }
+                }
+                
+                // Ensure parent directories exist (returns resolved workspace owner)
+                const copyOwnerId = await ensureParentDirs(copyNewFilePath, userId);
+                const copyIsGuest = String(copyOwnerId) !== String(userId);
                 
                 const copyData = {
                     ...copyFile.toObject(),
@@ -3753,14 +4502,17 @@ async function executeFileOperation(operation, data, userId, userRoles = []) {
                     // Remove these so pre-save middleware can calculate them from filePath
                     fileName: undefined,
                     parentPath: undefined,
-                    owner: userId,
+                    owner: copyOwnerId,
                     createdAt: new Date(),
                     updatedAt: new Date(),
-                    versionHistory: []
+                    versionHistory: [],
+                    ...(copyIsGuest && {
+                        permissions: {
+                            read: [userId],
+                            write: [userId]
+                        }
+                    })
                 };
-                
-                // Ensure parent directories exist for the new path
-                await ensureParentDirs(copyNewFilePath, userId);
                 
                 const copiedFile = await File.create(copyData);
                 
@@ -4028,6 +4780,14 @@ async function executeFileOperation(operation, data, userId, userRoles = []) {
                 // Update the file path - fileName and parentPath will be auto-calculated by the model
                 renameFile.filePath = renamedFilePath;
                 await renameFile.save();
+
+                // For directories, cascade-update all children
+                if (renameFile.type === 'directory') {
+                    const childCount = await cascadeChildPaths(effectiveFilePath, renamedFilePath, userId);
+                    if (childCount > 0) {
+                        logger.info('Cascaded rename to children', { oldPath: effectiveFilePath, newPath: renamedFilePath, childCount });
+                    }
+                }
 
                 // For text files, migrate Yjs doc and active sessions from old path to new path
                 if (renameFile.type === 'text') {

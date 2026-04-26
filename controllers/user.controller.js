@@ -1,6 +1,7 @@
 import User from '../models/user.model.js';
-import {Follow} from '../models/user.model.js';
+import {Connection} from '../models/user.model.js';
 import File from '../models/file.model.js';
+import Group, {GROUP_ROLES, GROUP_ROLE_HIERARCHY} from '../models/group.model.js';
 import Log from '../models/log.model.js';
 import mongoose from 'mongoose';
 import {asyncHandler} from '../middleware/app.middleware.js';
@@ -13,7 +14,7 @@ import {
 } from '../middleware/user.middleware.js';
 import {cache} from '../middleware/cache.middleware.js';
 import logger from '../utils/app.logger.js';
-import {sanitizeObject, sanitizeHtmlInObject} from '../utils/sanitize.js';
+import {sanitizeObject, sanitizeHtmlInObject, sanitizeHtmlInput} from '../utils/sanitize.js';
 import {
     parseFilters,
     getFilterSummary,
@@ -64,6 +65,18 @@ const userController = {
         try {
             // Parse filters and options using the universal filter system
             const {filters, options} = parseFilters(req.query);
+
+            // Override generic search with user-specific field search
+            if (req.query.search) {
+                const escapedSearch = req.query.search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                const searchRegex = { $regex: escapedSearch, $options: 'i' };
+                filters.$or = [
+                    { username: searchRegex },
+                    { firstName: searchRegex },
+                    { lastName: searchRegex },
+                    { email: searchRegex }
+                ];
+            }
 
             // Only show active users by default
             if (!filters.active) {
@@ -435,7 +448,7 @@ const userController = {
             // Check if roles are being updated and handle role requests
             if (updates.roles && hasRight(req.user.roles, RIGHTS.MANAGE_ALL_USERS)) {
                 const newRoles = normalizeRoles(updates.roles);
-                const currentPendingRoles = normalizeRoles(user.pendingRoles || []);
+                const currentPendingRoles = normalizeRoles(user.pendingRoles);
                 
                 // Check if the new roles include all pending roles
                 if (user.roleApprovalStatus === 'PENDING' && currentPendingRoles.length > 0) {
@@ -859,18 +872,18 @@ const userController = {
                     filters: filterSummary,
                     summary: {
                         totalFiles,
-                        totalSize: files.reduce((total, file) => total + (file.size || 0), 0),
+                        totalSize: files.reduce((total, file) => total + file.size, 0),
                         fileTypes: [...new Set(files.map(file => file.type).filter(Boolean))],
-                        inlineStorage: files.filter(file => file.storageType === 'inline').reduce((total, file) => total + (file.size || 0), 0),
-                        gridfsStorage: files.filter(file => file.storageType === 'gridfs').reduce((total, file) => total + (file.size || 0), 0),
+                        inlineStorage: files.filter(file => file.storageType === 'inline').reduce((total, file) => total + file.size, 0),
+                        gridfsStorage: files.filter(file => file.storageType === 'gridfs').reduce((total, file) => total + file.size, 0),
                         storageBreakdown: [
                             {
                                 type: 'inline',
-                                size: files.filter(file => file.storageType === 'inline').reduce((total, file) => total + (file.size || 0), 0)
+                                size: files.filter(file => file.storageType === 'inline').reduce((total, file) => total + file.size, 0)
                             },
                             {
                                 type: 'gridfs',
-                                size: files.filter(file => file.storageType === 'gridfs').reduce((total, file) => total + (file.size || 0), 0)
+                                size: files.filter(file => file.storageType === 'gridfs').reduce((total, file) => total + file.size, 0)
                             }
                         ].filter(item => item.size > 0)
                     },
@@ -973,10 +986,13 @@ const userController = {
                         {$limit: 10}
                     ]);
 
-                    // Calculate total storage used
+                    // Calculate total storage used (includes saved version sizes)
                     const storageUsed = await File.aggregate([
                         {$match: {owner: userObjectId}},
-                        {$group: {_id: null, totalSize: {$sum: {$ifNull: ['$size', 0]}}}}
+                        {$group: {_id: null, totalSize: {$sum: {$add: [
+                            {$ifNull: ['$size', 0]},
+                            {$sum: {$map: {input: {$ifNull: ['$versionHistory', []]}, as: 'v', in: {$ifNull: ['$$v.size', 0]}}}}
+                        ]}}}}
                     ]);
 
                     fileStats = {
@@ -1226,7 +1242,10 @@ const userController = {
                             } else if (fileField === 'totalStorage' && (isAdmin || isSelf)) {
                                 const storageResult = await File.aggregate([
                                     {$match: fileQuery},
-                                    {$group: {_id: null, totalSize: {$sum: {$ifNull: ['$size', 0]}}}}
+                                    {$group: {_id: null, totalSize: {$sum: {$add: [
+                                        {$ifNull: ['$size', 0]},
+                                        {$sum: {$map: {input: {$ifNull: ['$versionHistory', []]}, as: 'v', in: {$ifNull: ['$$v.size', 0]}}}}
+                                    ]}}}}
                                 ]);
 
                                 setNestedProperty(result.data, field,
@@ -1237,7 +1256,10 @@ const userController = {
                                     File.countDocuments(fileQuery),
                                     File.aggregate([
                                         {$match: fileQuery},
-                                        {$group: {_id: null, totalSize: {$sum: {$ifNull: ['$size', 0]}}}}
+                                        {$group: {_id: null, totalSize: {$sum: {$add: [
+                                            {$ifNull: ['$size', 0]},
+                                            {$sum: {$map: {input: {$ifNull: ['$versionHistory', []]}, as: 'v', in: {$ifNull: ['$$v.size', 0]}}}}
+                                        ]}}}}
                                     ])
                                 ]);
 
@@ -1514,235 +1536,945 @@ const userController = {
     }),
 
     // =========================================================================
-    // FOLLOW ACTIONS
+    // CONNECTION ACTIONS (LinkedIn-style symmetric connections)
     // =========================================================================
 
     /**
-     * @desc    Follow a user
-     * @route   POST /api/v1/users/:id/follow
+     * @desc    Send a connection request to a user
+     * @route   POST /api/v1/users/:id/connect
      * @access  Authenticated
      */
-    followUser: asyncHandler(async (req, res, next) => {
-        const followerId = req.user.id;
-        const followingId = req.params.id;
+    sendConnectionRequest: asyncHandler(async (req, res, next) => {
+        const requesterId = req.user.id;
+        const recipientId = req.params.id;
 
-        if (followerId === followingId) {
-            return next(new AppError('You cannot follow yourself', 400));
+        if (requesterId === recipientId) {
+            return next(new AppError('You cannot connect with yourself', 400));
         }
 
-        const targetUser = await User.findById(followingId).select('_id');
+        const targetUser = await User.findById(recipientId).select('_id');
         if (!targetUser) {
             return next(new AppError('User not found', 404));
         }
 
-        await Follow.findOneAndUpdate(
-            {follower: followerId, following: followingId},
-            {follower: followerId, following: followingId},
-            {upsert: true, new: true, setDefaultsOnInsert: true}
-        );
-
-        await Promise.all([
-            cache.del(`follows:followers:${followingId}`),
-            cache.del(`follows:following:${followerId}`),
-            cache.del(`follows:mutuals:${followerId}`),
-            cache.del(`follows:mutuals:${followingId}`),
-            cache.del(`follows:counts:${followerId}`),
-            cache.del(`follows:counts:${followingId}`)
-        ]);
-
-        logger.info(`[Follow] ${followerId} followed ${followingId}`);
-
-        res.status(200).json({
-            success: true,
-            message: 'User followed successfully'
-        });
-    }),
-
-    /**
-     * @desc    Unfollow a user
-     * @route   DELETE /api/v1/users/:id/follow
-     * @access  Authenticated
-     */
-    unfollowUser: asyncHandler(async (req, res, next) => {
-        const followerId = req.user.id;
-        const followingId = req.params.id;
-
-        const result = await Follow.findOneAndDelete({
-            follower: followerId,
-            following: followingId
+        // Check if a connection already exists in either direction
+        const existing = await Connection.findOne({
+            $or: [
+                {requester: requesterId, recipient: recipientId},
+                {requester: recipientId, recipient: requesterId}
+            ]
         });
 
-        if (!result) {
-            return next(new AppError('You are not following this user', 400));
+        if (existing) {
+            if (existing.status === 'accepted') {
+                return next(new AppError('You are already connected with this user', 400));
+            }
+            if (existing.status === 'pending') {
+                // If the other user already sent us a request, auto-accept
+                if (existing.requester.toString() === recipientId) {
+                    existing.status = 'accepted';
+                    await existing.save();
+
+                    await Promise.all([
+                        cache.del(`connections:${requesterId}`),
+                        cache.del(`connections:${recipientId}`),
+                        cache.del(`connections:pending:${requesterId}`),
+                        cache.del(`connections:pending:${recipientId}`),
+                        cache.del(`connections:sent:${requesterId}`),
+                        cache.del(`connections:sent:${recipientId}`),
+                        cache.del(`connections:counts:${requesterId}`),
+                        cache.del(`connections:counts:${recipientId}`)
+                    ]);
+
+                    logger.info(`[Connection] ${requesterId} auto-accepted connection with ${recipientId}`);
+
+                    return res.status(200).json({
+                        success: true,
+                        message: 'Connection request accepted (mutual request)'
+                    });
+                }
+                return next(new AppError('Connection request already sent', 400));
+            }
+            if (existing.status === 'rejected') {
+                // Allow re-requesting after rejection
+                existing.status = 'pending';
+                existing.requester = requesterId;
+                existing.recipient = recipientId;
+                await existing.save();
+
+                await Promise.all([
+                    cache.del(`connections:pending:${recipientId}`),
+                    cache.del(`connections:sent:${requesterId}`),
+                    cache.del(`connections:counts:${requesterId}`),
+                    cache.del(`connections:counts:${recipientId}`)
+                ]);
+
+                logger.info(`[Connection] ${requesterId} re-sent connection request to ${recipientId}`);
+
+                return res.status(200).json({
+                    success: true,
+                    message: 'Connection request sent'
+                });
+            }
         }
 
+        await Connection.create({requester: requesterId, recipient: recipientId});
+
         await Promise.all([
-            cache.del(`follows:followers:${followingId}`),
-            cache.del(`follows:following:${followerId}`),
-            cache.del(`follows:mutuals:${followerId}`),
-            cache.del(`follows:mutuals:${followingId}`),
-            cache.del(`follows:counts:${followerId}`),
-            cache.del(`follows:counts:${followingId}`)
+            cache.del(`connections:pending:${recipientId}`),
+            cache.del(`connections:sent:${requesterId}`),
+            cache.del(`connections:counts:${requesterId}`),
+            cache.del(`connections:counts:${recipientId}`)
         ]);
 
-        logger.info(`[Follow] ${followerId} unfollowed ${followingId}`);
+        logger.info(`[Connection] ${requesterId} sent connection request to ${recipientId}`);
 
         res.status(200).json({
             success: true,
-            message: 'User unfollowed successfully'
+            message: 'Connection request sent'
         });
     }),
 
     /**
-     * @desc    Get users that the specified user is following
-     * @route   GET /api/v1/users/:id/following
+     * @desc    Respond to a connection request (accept or reject)
+     * @route   PUT /api/v1/users/:id/connect
      * @access  Authenticated
      */
-    getFollowing: asyncHandler(async (req, res) => {
-        const userId = req.params.id;
-        const page = Math.max(1, parseInt(req.query.page, 10) || 1);
-        const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 20));
-        const skip = (page - 1) * limit;
+    respondToConnection: asyncHandler(async (req, res, next) => {
+        const currentUserId = req.user.id;
+        const requesterId = req.params.id;
+        const {action} = req.body;
 
-        const [follows, total] = await Promise.all([
-            Follow.find({follower: userId})
-                .sort({createdAt: -1})
-                .skip(skip)
-                .limit(limit)
-                .populate('following', 'firstName lastName username email profilePhoto'),
-            Follow.countDocuments({follower: userId})
+        if (!['accept', 'reject'].includes(action)) {
+            return next(new AppError('Action must be "accept" or "reject"', 400));
+        }
+
+        const connection = await Connection.findOne({
+            requester: requesterId,
+            recipient: currentUserId,
+            status: 'pending'
+        });
+
+        if (!connection) {
+            return next(new AppError('No pending connection request from this user', 404));
+        }
+
+        connection.status = action === 'accept' ? 'accepted' : 'rejected';
+        await connection.save();
+
+        await Promise.all([
+            cache.del(`connections:${currentUserId}`),
+            cache.del(`connections:${requesterId}`),
+            cache.del(`connections:pending:${currentUserId}`),
+            cache.del(`connections:sent:${requesterId}`),
+            cache.del(`connections:counts:${currentUserId}`),
+            cache.del(`connections:counts:${requesterId}`)
         ]);
 
+        logger.info(`[Connection] ${currentUserId} ${action}ed request from ${requesterId}`);
+
         res.status(200).json({
             success: true,
-            data: follows.map(f => f.following),
-            pagination: {page, limit, total, pages: Math.ceil(total / limit)}
+            message: `Connection request ${action}ed`
         });
     }),
 
     /**
-     * @desc    Get followers of a user
-     * @route   GET /api/v1/users/:id/followers
+     * @desc    Remove a connection or cancel a sent request
+     * @route   DELETE /api/v1/users/:id/connect
      * @access  Authenticated
      */
-    getFollowers: asyncHandler(async (req, res) => {
-        const userId = req.params.id;
-        const page = Math.max(1, parseInt(req.query.page, 10) || 1);
-        const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 20));
-        const skip = (page - 1) * limit;
-
-        const [follows, total] = await Promise.all([
-            Follow.find({following: userId})
-                .sort({createdAt: -1})
-                .skip(skip)
-                .limit(limit)
-                .populate('follower', 'firstName lastName username email profilePhoto'),
-            Follow.countDocuments({following: userId})
-        ]);
-
-        res.status(200).json({
-            success: true,
-            data: follows.map(f => f.follower),
-            pagination: {page, limit, total, pages: Math.ceil(total / limit)}
-        });
-    }),
-
-    /**
-     * @desc    Get mutual follows (users who follow each other)
-     * @route   GET /api/v1/users/mutuals
-     * @access  Authenticated
-     */
-    getMutuals: asyncHandler(async (req, res) => {
-        const userId = new mongoose.Types.ObjectId(req.user.id);
-        const page = Math.max(1, parseInt(req.query.page, 10) || 1);
-        const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 20));
-        const skip = (page - 1) * limit;
-
-        const pipeline = [
-            {$match: {follower: userId}},
-            {
-                $lookup: {
-                    from: 'follows',
-                    let: {targetUser: '$following'},
-                    pipeline: [
-                        {
-                            $match: {
-                                $expr: {
-                                    $and: [
-                                        {$eq: ['$follower', '$$targetUser']},
-                                        {$eq: ['$following', userId]}
-                                    ]
-                                }
-                            }
-                        }
-                    ],
-                    as: 'reverse'
-                }
-            },
-            {$match: {'reverse.0': {$exists: true}}},
-            {
-                $facet: {
-                    data: [{$skip: skip}, {$limit: limit}],
-                    count: [{$count: 'total'}]
-                }
-            }
-        ];
-
-        const [result] = await Follow.aggregate(pipeline);
-        const mutualFollowDocs = result.data || [];
-        const total = result.count[0]?.total || 0;
-
-        const mutualUserIds = mutualFollowDocs.map(d => d.following);
-        const mutualUsers = await User.find({_id: {$in: mutualUserIds}})
-            .select('firstName lastName username email profilePhoto');
-
-        res.status(200).json({
-            success: true,
-            data: mutualUsers,
-            pagination: {page, limit, total, pages: Math.ceil(total / limit)}
-        });
-    }),
-
-    /**
-     * @desc    Get follow counts for a user
-     * @route   GET /api/v1/users/:id/follow-counts
-     * @access  Authenticated
-     */
-    getFollowCounts: asyncHandler(async (req, res) => {
-        const userId = req.params.id;
-
-        const [followingCount, followerCount] = await Promise.all([
-            Follow.countDocuments({follower: userId}),
-            Follow.countDocuments({following: userId})
-        ]);
-
-        res.status(200).json({
-            success: true,
-            data: {followingCount, followerCount}
-        });
-    }),
-
-    /**
-     * @desc    Check if current user follows a specific user
-     * @route   GET /api/v1/users/:id/follow-status
-     * @access  Authenticated
-     */
-    getFollowStatus: asyncHandler(async (req, res) => {
+    removeConnection: asyncHandler(async (req, res, next) => {
         const currentUserId = req.user.id;
         const targetUserId = req.params.id;
 
-        const [isFollowing, isFollowedBy] = await Promise.all([
-            Follow.exists({follower: currentUserId, following: targetUserId}),
-            Follow.exists({follower: targetUserId, following: currentUserId})
+        const result = await Connection.findOneAndDelete({
+            $or: [
+                {requester: currentUserId, recipient: targetUserId},
+                {requester: targetUserId, recipient: currentUserId}
+            ]
+        });
+
+        if (!result) {
+            return next(new AppError('No connection found with this user', 400));
+        }
+
+        await Promise.all([
+            cache.del(`connections:${currentUserId}`),
+            cache.del(`connections:${targetUserId}`),
+            cache.del(`connections:pending:${currentUserId}`),
+            cache.del(`connections:pending:${targetUserId}`),
+            cache.del(`connections:sent:${currentUserId}`),
+            cache.del(`connections:sent:${targetUserId}`),
+            cache.del(`connections:counts:${currentUserId}`),
+            cache.del(`connections:counts:${targetUserId}`)
         ]);
+
+        logger.info(`[Connection] ${currentUserId} removed connection with ${targetUserId}`);
+
+        res.status(200).json({
+            success: true,
+            message: 'Connection removed'
+        });
+    }),
+
+    /**
+     * @desc    Get accepted connections for a user
+     * @route   GET /api/v1/users/:id/connections
+     * @access  Authenticated
+     */
+    getConnections: asyncHandler(async (req, res) => {
+        const userId = req.params.id;
+        const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+        const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 20));
+        const skip = (page - 1) * limit;
+
+        const [connections, total] = await Promise.all([
+            Connection.find({
+                $or: [{requester: userId}, {recipient: userId}],
+                status: 'accepted'
+            })
+                .sort({updatedAt: -1})
+                .skip(skip)
+                .limit(limit)
+                .populate('requester', 'firstName lastName username email profilePhoto')
+                .populate('recipient', 'firstName lastName username email profilePhoto'),
+            Connection.countDocuments({
+                $or: [{requester: userId}, {recipient: userId}],
+                status: 'accepted'
+            })
+        ]);
+
+        // Return the other user in each connection
+        const data = connections.map(c => {
+            return c.requester._id.toString() === userId ? c.recipient : c.requester;
+        });
+
+        res.status(200).json({
+            success: true,
+            data,
+            pagination: {page, limit, total, pages: Math.ceil(total / limit)}
+        });
+    }),
+
+    /**
+     * @desc    Get pending incoming connection requests
+     * @route   GET /api/v1/users/connections/pending
+     * @access  Authenticated
+     */
+    getPendingRequests: asyncHandler(async (req, res) => {
+        const userId = req.user.id;
+        const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+        const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 20));
+        const skip = (page - 1) * limit;
+
+        const [requests, total] = await Promise.all([
+            Connection.find({recipient: userId, status: 'pending'})
+                .sort({createdAt: -1})
+                .skip(skip)
+                .limit(limit)
+                .populate('requester', 'firstName lastName username email profilePhoto'),
+            Connection.countDocuments({recipient: userId, status: 'pending'})
+        ]);
+
+        res.status(200).json({
+            success: true,
+            data: requests.map(r => r.requester),
+            pagination: {page, limit, total, pages: Math.ceil(total / limit)}
+        });
+    }),
+
+    /**
+     * @desc    Get sent outgoing connection requests
+     * @route   GET /api/v1/users/connections/sent
+     * @access  Authenticated
+     */
+    getSentRequests: asyncHandler(async (req, res) => {
+        const userId = req.user.id;
+        const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+        const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 20));
+        const skip = (page - 1) * limit;
+
+        const [requests, total] = await Promise.all([
+            Connection.find({requester: userId, status: 'pending'})
+                .sort({createdAt: -1})
+                .skip(skip)
+                .limit(limit)
+                .populate('recipient', 'firstName lastName username email profilePhoto'),
+            Connection.countDocuments({requester: userId, status: 'pending'})
+        ]);
+
+        res.status(200).json({
+            success: true,
+            data: requests.map(r => r.recipient),
+            pagination: {page, limit, total, pages: Math.ceil(total / limit)}
+        });
+    }),
+
+    /**
+     * @desc    Get connection counts for a user
+     * @route   GET /api/v1/users/:id/connection-counts
+     * @access  Authenticated
+     */
+    getConnectionCounts: asyncHandler(async (req, res) => {
+        const userId = req.params.id;
+
+        const [connectionCount, pendingCount] = await Promise.all([
+            Connection.countDocuments({
+                $or: [{requester: userId}, {recipient: userId}],
+                status: 'accepted'
+            }),
+            Connection.countDocuments({recipient: userId, status: 'pending'})
+        ]);
+
+        res.status(200).json({
+            success: true,
+            data: {connectionCount, pendingCount}
+        });
+    }),
+
+    /**
+     * @desc    Check connection status with a user
+     * @route   GET /api/v1/users/:id/connection-status
+     * @access  Authenticated
+     */
+    getConnectionStatus: asyncHandler(async (req, res) => {
+        const currentUserId = req.user.id;
+        const targetUserId = req.params.id;
+
+        const connection = await Connection.findOne({
+            $or: [
+                {requester: currentUserId, recipient: targetUserId},
+                {requester: targetUserId, recipient: currentUserId}
+            ]
+        });
+
+        let status = 'none';
+        if (connection) {
+            if (connection.status === 'accepted') {
+                status = 'connected';
+            } else if (connection.status === 'pending') {
+                status = connection.requester.toString() === currentUserId ? 'pending_sent' : 'pending_received';
+            } else if (connection.status === 'rejected') {
+                status = 'rejected';
+            }
+        }
 
         res.status(200).json({
             success: true,
             data: {
-                isFollowing: !!isFollowing,
-                isFollowedBy: !!isFollowedBy,
-                isMutual: !!isFollowing && !!isFollowedBy
+                status,
+                isConnected: connection?.status === 'accepted'
             }
+        });
+    }),
+
+    // =========================================================================
+    // GROUP OPERATIONS
+    // =========================================================================
+
+    /**
+     * @desc    Create a new group
+     * @route   POST /api/v1/groups
+     * @access  Authenticated
+     */
+    createGroup: asyncHandler(async (req, res) => {
+        const {name, description, privacy} = req.body;
+        const userId = req.user.id;
+
+        const group = await Group.create({
+            name: sanitizeHtmlInput(name),
+            description: description ? sanitizeHtmlInput(description) : undefined,
+            privacy: privacy || 'private',
+            createdBy: userId,
+            members: [{user: userId, role: GROUP_ROLES.OWNER}]
+        });
+
+        // Derive a URL-safe slug from the group name.
+        // The slug becomes the folder path and the URL segment — no IDs exposed.
+        const slug = group.name
+            .toLowerCase()
+            .replace(/\s+/g, '-')
+            .replace(/[^a-z0-9-]/g, '')
+            .replace(/-+/g, '-')
+            .replace(/^-|-$/g, '') || 'group';
+
+        // Ensure the slug is unique across all root-level directories
+        let groupFolder = `/${slug}`;
+        const collision = await File.findOne({filePath: groupFolder, type: 'directory'});
+        if (collision) groupFolder = `/${slug}-${group._id.toString().slice(-6)}`;
+
+        await File.create({
+            filePath: groupFolder,
+            fileName: group.name,
+            type: 'directory',
+            mimeType: 'inode/directory',
+            parentPath: '/',
+            depth: 1,
+            description: `Group folder: ${group.name}`,
+            owner: userId,
+            lastModifiedBy: userId,
+            permissions: {read: [], write: []},
+            size: 0
+        });
+
+        group.rootFolderPath = groupFolder;
+        await group.save();
+
+        await cache.del(`groups:user:${userId}`);
+
+        logger.info(`[Group] Group "${group.name}" created by ${userId}, folder at ${groupFolder}`);
+
+        res.status(201).json({
+            success: true,
+            data: group
+        });
+    }),
+
+    /**
+     * @desc    Get group by ID
+     * @route   GET /api/v1/groups/:groupId
+     * @access  Members / public groups
+     */
+    getGroup: asyncHandler(async (req, res, next) => {
+        const group = req.group; // set by loadGroup middleware
+
+        // Populate member user details
+        await group.populate('members.user', 'firstName lastName username email profilePhoto');
+
+        res.status(200).json({
+            success: true,
+            data: group
+        });
+    }),
+
+    /**
+     * @desc    Update group details (name, description, privacy, avatar)
+     * @route   PATCH /api/v1/groups/:groupId
+     * @access  Group ADMIN+
+     */
+    updateGroup: asyncHandler(async (req, res, next) => {
+        const group = req.group;
+        const {name, description, privacy, avatar} = req.body;
+
+        if (name !== undefined) group.name = sanitizeHtmlInput(name);
+        if (description !== undefined) group.description = sanitizeHtmlInput(description);
+        if (privacy !== undefined) group.privacy = privacy;
+        if (avatar !== undefined) group.avatar = avatar;
+
+        // If the name changed, rename the group folder and cascade-update all nested paths.
+        if (name !== undefined && group.rootFolderPath) {
+            const newSlug = group.name
+                .toLowerCase()
+                .replace(/\s+/g, '-')
+                .replace(/[^a-z0-9-]/g, '')
+                .replace(/-+/g, '-')
+                .replace(/^-|-$/g, '') || 'group';
+            const newPath = `/${newSlug}`;
+            const oldPath = group.rootFolderPath;
+
+            if (oldPath !== newPath) {
+                // Check for collision before renaming
+                const collision = await File.findOne({filePath: newPath, type: 'directory'});
+                if (collision) return next(new AppError(`Folder path ${newPath} is already in use`, 409));
+
+                const escapedOld = oldPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                // Cascade rename: replace old prefix in filePath and parentPath
+                await File.updateMany(
+                    {filePath: {$regex: `^${escapedOld}(/|$)`}},
+                    [{$set: {
+                        filePath:   {$replaceAll: {input: '$filePath',   find: oldPath, replacement: newPath}},
+                        parentPath: {$replaceAll: {input: '$parentPath', find: oldPath, replacement: newPath}}
+                    }}]
+                );
+                group.rootFolderPath = newPath;
+            }
+
+            // Keep fileName in sync with current display name
+            await File.updateOne(
+                {filePath: group.rootFolderPath, type: 'directory'},
+                {$set: {fileName: group.name}}
+            );
+        }
+
+        await group.save();
+        await cache.del(`groups:detail:${group._id}`);
+
+        res.status(200).json({
+            success: true,
+            data: group
+        });
+    }),
+
+    /**
+     * @desc    Delete a group
+     * @route   DELETE /api/v1/groups/:groupId
+     * @access  Group OWNER only
+     */
+    deleteGroup: asyncHandler(async (req, res, next) => {
+        const group = req.group;
+        const userId = req.user.id;
+
+        if (!group.hasMinRole(userId, GROUP_ROLES.OWNER)) {
+            return next(new AppError('Only the group owner can delete the group', 403));
+        }
+
+        // Cascade-delete all File records inside the group's root folder
+        if (group.rootFolderPath) {
+            // Escape any regex special chars in the path before building the prefix regex
+            const escapedPath = group.rootFolderPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            await File.deleteMany({
+                $or: [
+                    {filePath: group.rootFolderPath},
+                    {filePath: {$regex: `^${escapedPath}/`}}
+                ]
+            });
+        }
+
+        // Invalidate caches for all members
+        const memberIds = group.members.map(m => m.user);
+        await Group.findByIdAndDelete(group._id);
+
+        await Promise.all(
+            memberIds.map(id => cache.del(`groups:user:${id}`))
+        );
+        await cache.del(`groups:detail:${group._id}`);
+
+        logger.info(`[Group] Group "${group.name}" deleted by ${userId}`);
+
+        res.status(200).json({
+            success: true,
+            message: 'Group deleted successfully'
+        });
+    }),
+
+    /**
+     * @desc    List groups the current user belongs to
+     * @route   GET /api/v1/groups
+     * @access  Authenticated
+     */
+    getMyGroups: asyncHandler(async (req, res) => {
+        const userId = req.user.id;
+        const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+        const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 20));
+        const skip = (page - 1) * limit;
+
+        const filter = {'members.user': userId};
+        const [groups, total] = await Promise.all([
+            Group.find(filter)
+                .sort({updatedAt: -1})
+                .skip(skip)
+                .limit(limit)
+                .populate('members.user', 'firstName lastName username profilePhoto'),
+            Group.countDocuments(filter)
+        ]);
+
+        res.status(200).json({
+            success: true,
+            data: groups,
+            pagination: {page, limit, total, pages: Math.ceil(total / limit)}
+        });
+    }),
+
+    /**
+     * @desc    Discover public groups
+     * @route   GET /api/v1/groups/discover
+     * @access  Authenticated
+     */
+    discoverGroups: asyncHandler(async (req, res) => {
+        const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+        const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 20));
+        const skip = (page - 1) * limit;
+        const search = req.query.search;
+
+        const filter = {privacy: 'public'};
+        if (search) {
+            // Escape regex special characters to prevent ReDoS / injection
+            const escaped = search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            filter.name = {$regex: escaped, $options: 'i'};
+        }
+
+        const [groups, total] = await Promise.all([
+            Group.find(filter)
+                .sort({memberCount: -1, createdAt: -1})
+                .skip(skip)
+                .limit(limit)
+                .select('name description avatar privacy memberCount fileCount createdAt'),
+            Group.countDocuments(filter)
+        ]);
+
+        res.status(200).json({
+            success: true,
+            data: groups,
+            pagination: {page, limit, total, pages: Math.ceil(total / limit)}
+        });
+    }),
+
+    // =========================================================================
+    // GROUP MEMBER MANAGEMENT
+    // =========================================================================
+
+    /**
+     * @desc    Add a member to a group
+     * @route   POST /api/v1/groups/:groupId/members
+     * @access  Group ADMIN+
+     */
+    addMember: asyncHandler(async (req, res, next) => {
+        const group = req.group;
+        const {userId, role} = req.body;
+
+        // Verify target user exists
+        const targetUser = await User.findById(userId).select('_id');
+        if (!targetUser) {
+            return next(new AppError('User not found', 404));
+        }
+
+        // Check if already a member
+        if (group.isMember(userId)) {
+            return next(new AppError('User is already a member of this group', 400));
+        }
+
+        // Only WRITE or READ can be assigned directly; OWNER is only via transfer
+        const assignedRole = role || GROUP_ROLES.READ;
+        if (assignedRole === GROUP_ROLES.OWNER) {
+            return next(new AppError('Cannot directly assign OWNER role. Use ownership transfer.', 403));
+        }
+
+        group.members.push({user: userId, role: assignedRole});
+        await group.save();
+
+        // Propagate role to ALL files under the group folder (not just the root)
+        if (group.rootFolderPath) {
+            const addField  = assignedRole === GROUP_ROLES.WRITE ? 'permissions.write' : 'permissions.read';
+            const pullField = assignedRole === GROUP_ROLES.WRITE ? 'permissions.read'  : 'permissions.write';
+            const uid = new mongoose.Types.ObjectId(userId);
+            const escaped = group.rootFolderPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            await File.updateMany(
+                {filePath: {$regex: `^${escaped}(/|$)`}},
+                {$addToSet: {[addField]: uid}, $pull: {[pullField]: uid}}
+            );
+        }
+
+        await Promise.all([
+            cache.del(`groups:detail:${group._id}`),
+            cache.del(`groups:user:${userId}`)
+        ]);
+
+        logger.info(`[Group] User ${userId} added to group ${group._id} as ${assignedRole}`);
+
+        res.status(200).json({
+            success: true,
+            message: 'Member added successfully'
+        });
+    }),
+
+    /**
+     * @desc    Remove a member from a group
+     * @route   DELETE /api/v1/groups/:groupId/members/:userId
+     * @access  Group ADMIN+ or self
+     */
+    removeMember: asyncHandler(async (req, res, next) => {
+        const group = req.group;
+        const targetUserId = req.params.userId;
+        const actorId = req.user.id;
+
+        const targetMember = group.members.find(m => m.user.equals(targetUserId));
+        if (!targetMember) {
+            return next(new AppError('User is not a member of this group', 404));
+        }
+
+        // Owner cannot be removed
+        if (targetMember.role === GROUP_ROLES.OWNER) {
+            return next(new AppError('The group owner cannot be removed', 403));
+        }
+
+        // Self-removal is always allowed (except owner); only OWNER can remove others
+        const isSelf = actorId === targetUserId;
+        if (!isSelf && !group.hasMinRole(actorId, GROUP_ROLES.OWNER)) {
+            return next(new AppError('Only the group owner can remove other members', 403));
+        }
+
+        group.members = group.members.filter(m => !m.user.equals(targetUserId));
+        await group.save();
+
+        // Remove from ALL files under the group folder
+        if (group.rootFolderPath) {
+            const uid = new mongoose.Types.ObjectId(targetUserId);
+            const escaped = group.rootFolderPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            await File.updateMany(
+                {filePath: {$regex: `^${escaped}(/|$)`}},
+                {$pull: {'permissions.read': uid, 'permissions.write': uid}}
+            );
+        }
+
+        await Promise.all([
+            cache.del(`groups:detail:${group._id}`),
+            cache.del(`groups:user:${targetUserId}`)
+        ]);
+
+        res.status(200).json({
+            success: true,
+            message: isSelf ? 'You have left the group' : 'Member removed successfully'
+        });
+    }),
+
+    /**
+     * @desc    Update a member's role
+     * @route   PATCH /api/v1/groups/:groupId/members/:userId
+     * @access  Group OWNER (for admin promotion), ADMIN+ for lower roles
+     */
+    updateMemberRole: asyncHandler(async (req, res, next) => {
+        const group = req.group;
+        const targetUserId = req.params.userId;
+        const {role: newRole} = req.body;
+
+        // Only WRITE or READ can be assigned; OWNER is set via transfer only
+        if (![GROUP_ROLES.WRITE, GROUP_ROLES.READ].includes(newRole)) {
+            return next(new AppError('Role must be WRITE or READ', 400));
+        }
+
+        const targetMember = group.members.find(m => m.user.equals(targetUserId));
+        if (!targetMember) {
+            return next(new AppError('User is not a member of this group', 404));
+        }
+
+        // Cannot change owner's role
+        if (targetMember.role === GROUP_ROLES.OWNER) {
+            return next(new AppError('Cannot change the owner\'s role', 403));
+        }
+
+        targetMember.role = newRole;
+        await group.save();
+
+        // Move user between permission arrays across ALL files under the group folder
+        if (group.rootFolderPath) {
+            const uid       = new mongoose.Types.ObjectId(targetUserId);
+            const addField  = newRole === GROUP_ROLES.WRITE ? 'permissions.write' : 'permissions.read';
+            const pullField = newRole === GROUP_ROLES.WRITE ? 'permissions.read'  : 'permissions.write';
+            const escaped = group.rootFolderPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            await File.updateMany(
+                {filePath: {$regex: `^${escaped}(/|$)`}},
+                {$addToSet: {[addField]: uid}, $pull: {[pullField]: uid}}
+            );
+        }
+
+        await cache.del(`groups:detail:${group._id}`);
+
+        res.status(200).json({
+            success: true,
+            message: `Member role updated to ${newRole}`
+        });
+    }),
+
+    /**
+     * @desc    Join a public group
+     * @route   POST /api/v1/groups/:groupId/join
+     * @access  Authenticated
+     */
+    joinGroup: asyncHandler(async (req, res, next) => {
+        const group = req.group;
+        const userId = req.user.id;
+
+        if (group.privacy !== 'public') {
+            return next(new AppError('This group is private. You need an invite to join.', 403));
+        }
+
+        if (group.isMember(userId)) {
+            return next(new AppError('You are already a member of this group', 400));
+        }
+
+        group.members.push({user: userId, role: GROUP_ROLES.READ});
+        await group.save();
+
+        // Grant read access on ALL files under the group folder
+        if (group.rootFolderPath) {
+            const uid = new mongoose.Types.ObjectId(userId);
+            const escaped = group.rootFolderPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            await File.updateMany(
+                {filePath: {$regex: `^${escaped}(/|$)`}},
+                {$addToSet: {'permissions.read': uid}}
+            );
+        }
+
+        await Promise.all([
+            cache.del(`groups:detail:${group._id}`),
+            cache.del(`groups:user:${userId}`)
+        ]);
+
+        res.status(200).json({
+            success: true,
+            message: 'Joined group successfully'
+        });
+    }),
+
+    /**
+     * @desc    Leave a group (alias for self-removal)
+     * @route   POST /api/v1/groups/:groupId/leave
+     * @access  Authenticated member
+     */
+    leaveGroup: asyncHandler(async (req, res, next) => {
+        const group = req.group;
+        const userId = req.user.id;
+
+        const member = group.members.find(m => m.user.equals(userId));
+        if (!member) {
+            return next(new AppError('You are not a member of this group', 400));
+        }
+
+        if (member.role === GROUP_ROLES.OWNER) {
+            return next(new AppError('Group owners cannot leave. Transfer ownership or delete the group.', 403));
+        }
+
+        group.members = group.members.filter(m => !m.user.equals(userId));
+        await group.save();
+
+        // Revoke permissions on ALL files under the group folder
+        if (group.rootFolderPath) {
+            const uid = new mongoose.Types.ObjectId(userId);
+            const escaped = group.rootFolderPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            await File.updateMany(
+                {filePath: {$regex: `^${escaped}(/|$)`}},
+                {$pull: {'permissions.read': uid, 'permissions.write': uid}}
+            );
+        }
+
+        await Promise.all([
+            cache.del(`groups:detail:${group._id}`),
+            cache.del(`groups:user:${userId}`)
+        ]);
+
+        res.status(200).json({
+            success: true,
+            message: 'You have left the group'
+        });
+    }),
+
+    /**
+     * @desc    Transfer group ownership
+     * @route   PATCH /api/v1/groups/:groupId/transfer
+     * @access  Group OWNER only
+     */
+    transferOwnership: asyncHandler(async (req, res, next) => {
+        const group = req.group;
+        const actorId = req.user.id;
+        const {userId: newOwnerId} = req.body;
+
+        if (!group.hasMinRole(actorId, GROUP_ROLES.OWNER)) {
+            return next(new AppError('Only the group owner can transfer ownership', 403));
+        }
+
+        const newOwnerMember = group.members.find(m => m.user.equals(newOwnerId));
+        if (!newOwnerMember) {
+            return next(new AppError('Target user must be a member of the group', 400));
+        }
+
+        // Demote current owner to WRITE, promote new owner
+        const currentOwner = group.members.find(m => m.user.equals(actorId));
+        currentOwner.role = GROUP_ROLES.WRITE;
+        newOwnerMember.role = GROUP_ROLES.OWNER;
+        await group.save();
+
+        // New owner gets write access across ALL files under the group folder
+        if (group.rootFolderPath) {
+            const uid = new mongoose.Types.ObjectId(newOwnerId);
+            const escaped = group.rootFolderPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            await File.updateMany(
+                {filePath: {$regex: `^${escaped}(/|$)`}},
+                {$addToSet: {'permissions.write': uid}, $pull: {'permissions.read': uid}}
+            );
+        }
+
+        await cache.del(`groups:detail:${group._id}`);
+
+        logger.info(`[Group] Ownership of group ${group._id} transferred from ${actorId} to ${newOwnerId}`);
+
+        res.status(200).json({
+            success: true,
+            message: 'Ownership transferred successfully'
+        });
+    }),
+
+    // =========================================================================
+    // STARRED FILES
+    // =========================================================================
+
+    /**
+     * @desc    Get current user's starred files
+     * @route   GET /api/v1/users/starred
+     * @access  Authenticated
+     */
+    getStarredFiles: asyncHandler(async (req, res, next) => {
+        const userId = req.user.id;
+
+        const user = await User.findById(userId).populate({
+            path: 'starredFiles',
+            select: 'fileName filePath type mimeType size owner updatedAt',
+            populate: { path: 'owner', select: 'username firstName lastName' }
+        });
+
+        if (!user) {
+            return next(new AppError('User not found', 404));
+        }
+
+        // Filter out any files that no longer exist (deleted files)
+        const validFiles = user.starredFiles.filter(f => f != null);
+
+        res.status(200).json({
+            success: true,
+            data: validFiles
+        });
+    }),
+
+    /**
+     * @desc    Star (favorite) a file
+     * @route   POST /api/v1/users/starred/:fileId
+     * @access  Authenticated (must have read access to the file)
+     */
+    starFile: asyncHandler(async (req, res, next) => {
+        const userId = req.user.id;
+        const { fileId } = req.params;
+
+        // Verify the file exists and user has access
+        const file = await File.findById(fileId);
+        if (!file) {
+            return next(new AppError('File not found', 404));
+        }
+
+        if (!file.hasReadAccess(userId, req.user.roles)) {
+            return next(new AppError('You do not have access to this file', 403));
+        }
+
+        // Add to starred files (only if not already starred)
+        await User.findByIdAndUpdate(userId, {
+            $addToSet: { starredFiles: fileId }
+        });
+
+        await cache.del(`user:starred:${userId}`);
+
+        res.status(200).json({
+            success: true,
+            message: 'File starred'
+        });
+    }),
+
+    /**
+     * @desc    Unstar (unfavorite) a file
+     * @route   DELETE /api/v1/users/starred/:fileId
+     * @access  Authenticated
+     */
+    unstarFile: asyncHandler(async (req, res, next) => {
+        const userId = req.user.id;
+        const { fileId } = req.params;
+
+        await User.findByIdAndUpdate(userId, {
+            $pull: { starredFiles: fileId }
+        });
+
+        await cache.del(`user:starred:${userId}`);
+
+        res.status(200).json({
+            success: true,
+            message: 'File unstarred'
         });
     })
 };

@@ -1243,10 +1243,10 @@ const getLogStats = asyncHandler(async (req, res, next) => {
                     },
 
                     // Response time distribution
-                    distribution: responseTimeDistribution || [],
+                    distribution: responseTimeDistribution,
 
                     // Slowest endpoints
-                    slowestEndpoints: slowestEndpoints || [],
+                    slowestEndpoints: slowestEndpoints,
 
                     // Throughput metrics
                     throughput: throughputMetrics[0] || {
@@ -1258,15 +1258,15 @@ const getLogStats = asyncHandler(async (req, res, next) => {
 
                 // Traffic Patterns
                 trafficPatterns: {
-                    peakHours: peakTrafficHours || [],
-                    weekendVsWeekday: weekendVsWeekday || [],
-                    recentActivity: recentActivity || []
+                    peakHours: peakTrafficHours,
+                    weekendVsWeekday: weekendVsWeekday,
+                    recentActivity: recentActivity
                 },
 
                 // Security & Anomaly Detection
                 security: {
-                    suspiciousActivity: suspiciousActivity || [],
-                    rateLimitViolations: rateLimitViolations || 0,
+                    suspiciousActivity: suspiciousActivity,
+                    rateLimitViolations: rateLimitViolations,
                     ipAnalysis: ipAnalysis[0] || {
                         totalUniqueIPs: 0,
                         newIPs: 0,
@@ -1277,8 +1277,8 @@ const getLogStats = asyncHandler(async (req, res, next) => {
 
                 // Business Intelligence
                 businessIntelligence: {
-                    endpointPopularity: endpointPopularity || [],
-                    contentTypeDistribution: contentTypeDistribution || [],
+                    endpointPopularity: endpointPopularity,
+                    contentTypeDistribution: contentTypeDistribution,
                     userSessions: userSessionStats[0] || {
                         totalActiveSessions: 0,
                         avgSessionDuration: 0,
@@ -1294,22 +1294,22 @@ const getLogStats = asyncHandler(async (req, res, next) => {
                         successfulHealthChecks: 0,
                         availabilityPercentage: 0
                     },
-                    errorClustering: errorClustering || []
+                    errorClustering: errorClustering
                 },
 
                 // Breakdowns & Classifications
                 breakdowns: {
-                    statusCodeCategories: statusCodeCategoryStats || [],
-                    statusCodes: statusCodeStats || [],
-                    methods: methodStats || [],
-                    userAgentFamilies: userAgentFamilies || []
+                    statusCodeCategories: statusCodeCategoryStats,
+                    statusCodes: statusCodeStats,
+                    methods: methodStats,
+                    userAgentFamilies: userAgentFamilies
                 },
 
                 // Top Lists
                 topLists: {
-                    errorEndpoints: topErrorEndpoints || [],
-                    userAgents: topUserAgents || [],
-                    ipAddresses: topIPs || []
+                    errorEndpoints: topErrorEndpoints,
+                    userAgents: topUserAgents,
+                    ipAddresses: topIPs
                 },
 
                 // Meta information
@@ -1840,7 +1840,7 @@ const getGridFSStorageStats = async () => {
                 regular: {
                     totalFiles: regularFilesStats.totalFiles,
                     totalSize: regularFilesStats.totalSize,
-                    averageSize: regularFilesStats.averageSize || 0,
+                    averageSize: regularFilesStats.averageSize,
                     inlineFiles: regularFilesStats.inlineFiles || 0,
                     gridfsLinkedFiles: regularFilesStats.gridfsFiles || 0,
                     fileTypes: regularFilesStats.fileTypes || []
@@ -1848,7 +1848,7 @@ const getGridFSStorageStats = async () => {
                 gridfs: {
                     totalFiles: gridfsStats.totalFiles,
                     totalSize: gridfsStats.totalSize,
-                    averageSize: gridfsStats.averageSize || 0
+                    averageSize: gridfsStats.averageSize
                 }
             }
         };
@@ -2730,7 +2730,7 @@ const submitContactForm = asyncHandler(async (req, res, next) => {
         // Confirmation Email to User
         sendEmail({
             to: email,
-            subject: 'We received your message - FilesystemOne',
+            subject: 'We received your message - Filesystem One',
             template: 'contact-confirmation',
             data: {
                 name,

@@ -26,7 +26,7 @@ const FILE_EVENTS = {
     PERMISSIONS_CHANGED: 'permissions:changed',
     
     // Version operations
-    VERSION_PUBLISHED: 'version:published',
+    VERSION_SAVED: 'version:saved',
     VERSION_DELETED: 'version:deleted',
     VERSION_LOADED: 'version:loaded',
     
@@ -329,6 +329,7 @@ const fileFilter = (req, file, cb) => {
 const upload = multer({
     storage,
     fileFilter,
+    preservePath: true, // Keep directory paths in originalname for folder uploads
     limits: {
         fileSize: 500 * 1024 * 1024, // 500MB limit
         files: 20, // Max 20 files at once
@@ -818,7 +819,7 @@ class YjsService {
         const docName = this.getDocumentName(filePath);
         
         // Always get fresh document from persistence to ensure latest content
-        // This is critical for version publishing to capture current collaborative edits
+        // This is critical for version saving to capture current collaborative edits
         const ydoc = await this.persistence.getYDoc(docName);
         
         // Update cache with fresh document
