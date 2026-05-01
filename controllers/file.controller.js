@@ -689,25 +689,10 @@ const ensureParentDirs = async (filePath, userId) => {
     const ownerId = await resolveWorkspaceOwner(filePath, userId);
     
     for (let i = 0; i < dirs.length; i++) {
-        // Handle root directory case
+        // Skip the empty string that results from splitting a leading '/' — the
+        // filesystem root '/' is not a real folder and should not be stored as a
+        // document. Each user's actual root is '/<username>' created at signup.
         if (i === 0 && dirs[i] === '') {
-            await File.findOneAndUpdate(
-                { filePath: '/', type: 'directory' },
-                { $setOnInsert: {
-                    filePath: '/',
-                    fileName: 'root',
-                    type: 'directory',
-                    mimeType: 'inode/directory',
-                    parentPath: null,
-                    depth: 0,
-                    description: 'Root directory',
-                    owner: ownerId,
-                    lastModifiedBy: ownerId,
-                    permissions: { read: [], write: [] },
-                    size: 0
-                }},
-                { upsert: true, setDefaultsOnInsert: false }
-            );
             continue;
         }
         
