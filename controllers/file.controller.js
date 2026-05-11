@@ -574,16 +574,6 @@ const streamMediaImage = async (req, res, imageType) => {
     downloadStream.pipe(res);
 };
 
-const respondWithOperation = (res, result, defaultStatus = 200) => {
-    if (!result || result.success === false) {
-        throw new AppError(result?.error || result?.message || 'Operation failed', result?.statusCode || 400);
-    }
-    if (res.headersSent) return;
-    res.status(result.statusCode || defaultStatus).json(result);
-};
-
-
-
 /**
 /**
  * Propagates the parent directory's existing permissions onto a newly created
@@ -1001,8 +991,101 @@ const fileController = {
         const userId = getUserId(req);
         const userRoles = req.user?.roles || [];
 
-        const result = await executeFileOperation('getMetadata', {filePath: decodedFilePath}, userId, userRoles);
-        respondWithOperation(res, result);
+        const metaFile = await File.findOneWithReadPermission(
+            {filePath: decodedFilePath},
+            userId,
+            userRoles
+        );
+
+        if (!metaFile) {
+            throw new AppError('File not found or access denied', 404);
+        }
+
+        const versionStorageSize = metaFile.versionHistory.reduce((sum, v) => sum + (v.size || 0), 0);
+        const size = metaFile.size + versionStorageSize;
+
+        res.status(200).json({
+            success: true,
+            operation: 'getMetadata',
+            _id: metaFile._id,
+            filePath: metaFile.filePath,
+            fileName: metaFile.fileName,
+            type: metaFile.type,
+            mimeType: metaFile.mimeType,
+            size,
+            owner: metaFile.owner,
+            tags: metaFile.tags,
+            description: metaFile.description,
+            permissions: metaFile.permissions,
+            version: metaFile.version,
+            versionHistory: metaFile.versionHistory,
+            createdAt: metaFile.createdAt,
+            updatedAt: metaFile.updatedAt,
+            lastModifiedBy: metaFile.lastModifiedBy,
+            mediaMetadata: metaFile.mediaMetadata || null,
+            timestamp: new Date().toISOString()
+        });
+    }),
+
+    /**
+     * @desc    Get file-open bootstrap payload (metadata + optional initial content)
+     * @route   GET /api/v1/files/:filePath/open
+     * @access  Private (requires read permission)
+     */
+    getFileOpenBootstrap: asyncHandler(async (req, res) => {
+        const {filePath} = req.params;
+        const decodedFilePath = decodeFilePath(filePath);
+        const userId = getUserId(req);
+        const userRoles = req.user?.roles || [];
+
+        const metaFile = await File.findOneWithReadPermission(
+            {filePath: decodedFilePath},
+            userId,
+            userRoles
+        );
+        if (!metaFile) {
+            throw new AppError('File not found or access denied', 404);
+        }
+
+        const versionStorageSize = metaFile.versionHistory.reduce((sum, v) => sum + (v.size || 0), 0);
+        const size = metaFile.size + versionStorageSize;
+        const metadataResult = {
+            success: true,
+            operation: 'getMetadata',
+            _id: metaFile._id,
+            filePath: metaFile.filePath,
+            fileName: metaFile.fileName,
+            type: metaFile.type,
+            mimeType: metaFile.mimeType,
+            size,
+            owner: metaFile.owner,
+            tags: metaFile.tags,
+            description: metaFile.description,
+            permissions: metaFile.permissions,
+            version: metaFile.version,
+            versionHistory: metaFile.versionHistory,
+            createdAt: metaFile.createdAt,
+            updatedAt: metaFile.updatedAt,
+            lastModifiedBy: metaFile.lastModifiedBy,
+            mediaMetadata: metaFile.mediaMetadata || null,
+            timestamp: new Date().toISOString()
+        };
+
+        let initialContent = null;
+        if (metadataResult.type === 'text') {
+            initialContent = (await getAndDecompress(metaFile)) || '';
+        }
+
+        res.status(200).json({
+            success: true,
+            operation: 'open',
+            kind: metadataResult.type === 'directory' ? 'directory' : 'file',
+            filePath: decodedFilePath,
+            metadata: metadataResult,
+            initialContent,
+            collaborationRoom: metadataResult.type === 'text' ? `yjs${decodedFilePath}` : null,
+            timestamp: new Date().toISOString()
+        });
     }),
 
     /**
@@ -1016,8 +1099,30 @@ const fileController = {
         const userId = getUserId(req);
         const userRoles = req.user?.roles || [];
 
-        const result = await executeFileOperation('getContent', {filePath: decodedFilePath}, userId, userRoles);
-        respondWithOperation(res, result);
+        const file = await File.findOneWithReadPermission(
+            {filePath: decodedFilePath},
+            userId,
+            userRoles
+        );
+
+        if (!file) {
+            throw new AppError('File not found or access denied', 404);
+        }
+
+        const content = await getAndDecompress(file);
+        res.status(200).json({
+            success: true,
+            operation: 'getContent',
+            content,
+            fileType: file.type,
+            size: file.size,
+            mimeType: file.mimeType,
+            lastModified: file.updatedAt,
+            owner: file.owner.toString(),
+            version: file.version,
+            filePath: decodedFilePath,
+            timestamp: new Date().toISOString()
+        });
     }),
 
     /**
@@ -1032,12 +1137,40 @@ const fileController = {
         const userRoles = req.user?.roles || [];
         const {content} = req.body;
 
-        const result = await executeFileOperation('save', {
-            filePath: decodedFilePath,
-            content
-        }, userId, userRoles);
+        const file = await File.findOneWithWritePermission(
+            {filePath: decodedFilePath},
+            userId,
+            userRoles
+        );
 
-        respondWithOperation(res, result);
+        if (!file) {
+            throw new AppError('File not found or insufficient permissions', 404);
+        }
+        if (content === undefined || content === null) {
+            throw new AppError('Content is required for save operation', 400);
+        }
+        if (file.type === 'text') {
+            logger.error('TEXT FILE HTTP SAVE REJECTED', {
+                userId,
+                filePath: decodedFilePath,
+                fileType: file.type
+            });
+            throw new AppError('Text files cannot be saved via HTTP API. Use WebSocket collaborative editing instead.', 400);
+        }
+
+        await compressAndStore(file, content);
+        await cache.invalidateAllRelatedCaches('file', decodedFilePath, userId);
+
+        res.status(200).json({
+            success: true,
+            operation: 'save',
+            message: 'File content saved successfully',
+            version: file.version,
+            filePath: decodedFilePath,
+            fileType: file.type,
+            size: file.size,
+            timestamp: new Date().toISOString()
+        });
     }),
 
     /**
@@ -1052,12 +1185,33 @@ const fileController = {
         const userRoles = req.user?.roles || [];
         const {message} = req.body || {};
 
-        const result = await executeFileOperation('saveVersion', {
-            filePath: decodedFilePath,
-            message
-        }, userId, userRoles);
+        const versionFile = await File.findOneWithWritePermission(
+            {filePath: decodedFilePath},
+            userId,
+            userRoles
+        );
+        if (!versionFile) {
+            throw new AppError('File not found or insufficient permissions', 404);
+        }
 
-        respondWithOperation(res, result, 201);
+        const versionMessage = message || `Saved at ${new Date().toLocaleString()}`;
+        const updatedFile = await versionFile.createVersionSnapshot(
+            userId,
+            versionMessage,
+            (path) => yjsService.getTextContent(path)
+        );
+        const totalVersions = updatedFile.versionHistory.length;
+        const versionNumber = totalVersions;
+
+        res.status(201).json({
+            success: true,
+            operation: 'saveVersion',
+            message: `Version ${versionNumber} saved successfully`,
+            versionNumber,
+            versionCount: totalVersions,
+            filePath: decodedFilePath,
+            timestamp: new Date().toISOString()
+        });
     }),
 
     /**
@@ -1071,8 +1225,32 @@ const fileController = {
         const userId = getUserId(req);
         const userRoles = req.user?.roles || [];
 
-        const result = await executeFileOperation('getVersions', {filePath: decodedFilePath}, userId, userRoles);
-        respondWithOperation(res, result);
+        const versionsFile = await File.findOneWithReadPermission(
+            {filePath: decodedFilePath},
+            userId,
+            userRoles
+        );
+        if (!versionsFile) {
+            throw new AppError('File not found or insufficient permissions', 404);
+        }
+
+        const versions = versionsFile.versionHistory.map((version, index) => ({
+            ...version.toObject(),
+            version: index + 1,
+            isCurrent: index === versionsFile.versionHistory.length - 1,
+            createdAt: version.timestamp,
+            size: version.size || 0
+        }));
+
+        res.status(200).json({
+            success: true,
+            operation: 'getVersions',
+            message: 'File versions retrieved successfully',
+            versions,
+            totalVersions: versionsFile.versionHistory.length,
+            filePath: decodedFilePath,
+            timestamp: new Date().toISOString()
+        });
     }),
 
     /**
@@ -1086,12 +1264,42 @@ const fileController = {
         const userId = getUserId(req);
         const userRoles = req.user?.roles || [];
 
-        const result = await executeFileOperation('loadVersion', {
-            filePath: decodedFilePath,
-            versionNumber
-        }, userId, userRoles);
+        if (!versionNumber) {
+            throw new AppError('Version number is required', 400);
+        }
 
-        respondWithOperation(res, result);
+        const file = await File.findOneWithReadPermission(
+            {filePath: decodedFilePath},
+            userId,
+            userRoles
+        );
+        if (!file) {
+            throw new AppError('File not found or insufficient permissions', 404);
+        }
+
+        const parsedVersionNumber = parseInt(versionNumber, 10);
+        const versionIndex = parsedVersionNumber - 1;
+        if (versionIndex < 0 || versionIndex >= file.versionHistory.length) {
+            throw new AppError(`Version ${versionNumber} not found`, 404);
+        }
+
+        const versionToLoad = file.versionHistory[versionIndex];
+        const versionContent = await file.getVersionContent(parsedVersionNumber);
+        const clientContent = versionContent ? Buffer.from(versionContent, 'base64').toString('utf8') : '';
+
+        res.status(200).json({
+            success: true,
+            operation: 'loadVersion',
+            message: `Version ${versionNumber} loaded for viewing (current version unchanged)`,
+            content: clientContent,
+            versionNumber: parsedVersionNumber,
+            versionTimestamp: versionToLoad.timestamp,
+            versionMessage: versionToLoad.message,
+            currentVersion: file.version,
+            filePath: decodedFilePath,
+            timestamp: new Date().toISOString(),
+            readOnly: true
+        });
     }),
 
     /**
@@ -1105,10 +1313,31 @@ const fileController = {
         const userId = getUserId(req);
         const userRoles = req.user?.roles || [];
 
-        const result = await executeFileOperation('downloadVersion', {
-            filePath: decodedFilePath,
-            versionNumber
-        }, userId, userRoles);
+        if (!versionNumber) {
+            throw new AppError('Version number is required', 400);
+        }
+
+        const file = await File.findOneWithReadPermission(
+            {filePath: decodedFilePath},
+            userId,
+            userRoles
+        );
+        if (!file) {
+            throw new AppError('File not found or insufficient permissions', 404);
+        }
+
+        const parsedVersionNumber = parseInt(versionNumber, 10);
+        const versionIndex = parsedVersionNumber - 1;
+        if (versionIndex < 0 || versionIndex >= file.versionHistory.length) {
+            throw new AppError(`Version ${versionNumber} not found`, 404);
+        }
+
+        const versionContent = await file.getVersionContent(parsedVersionNumber);
+        const result = {
+            fileName: file.fileName,
+            mimeType: file.mimeType || 'application/octet-stream',
+            content: Buffer.from(versionContent, 'base64')
+        };
 
         // Set appropriate headers for download
         const fileName = result.fileName || `version_${versionNumber}`;
@@ -1130,12 +1359,30 @@ const fileController = {
         const userId = getUserId(req);
         const userRoles = req.user?.roles || [];
 
-        const result = await executeFileOperation('deleteVersion', {
-            filePath: decodedFilePath,
-            versionNumber
-        }, userId, userRoles);
+        if (!versionNumber) {
+            throw new AppError('Version number is required', 400);
+        }
 
-        respondWithOperation(res, result);
+        const file = await File.findOneWithWritePermission(
+            {filePath: decodedFilePath},
+            userId,
+            userRoles
+        );
+        if (!file) {
+            throw new AppError('File not found or insufficient permissions', 404);
+        }
+
+        const deleteResult = await file.deleteVersion(parseInt(versionNumber, 10), userId);
+        await cache.invalidateAllRelatedCaches('file', decodedFilePath, userId);
+
+        res.status(200).json({
+            success: true,
+            operation: 'deleteVersion',
+            message: deleteResult.message,
+            remainingVersions: deleteResult.remainingVersions,
+            filePath: decodedFilePath,
+            timestamp: new Date().toISOString()
+        });
     }),
 
     /**
@@ -1160,14 +1407,58 @@ const fileController = {
             }
         }
 
-        const result = await executeFileOperation('create', {
-            filePath: normalizedPath,
-            content,
-            message: description
-        }, userId, userRoles);
+        const parentPath = path.posix.dirname(normalizedPath);
+        if (parentPath === '/') {
+            throw new AppError('Cannot create files directly at the filesystem root', 403);
+        }
 
+        const parentWritable = await File.findOneWithWritePermission(
+            { filePath: parentPath, type: 'directory' },
+            userId,
+            userRoles
+        );
+        if (!parentWritable) {
+            throw new AppError('You do not have write permission in the destination directory', 403);
+        }
+
+        const createOwnerId = await ensureParentDirs(normalizedPath, userId);
+        const createIsGuest = String(createOwnerId) !== String(userId);
+
+        const newFile = await File.create({
+            filePath: normalizedPath,
+            type: 'text',
+            description: description || 'Created via API request',
+            owner: createOwnerId,
+            ...(createIsGuest && {
+                permissions: {
+                    read: [userId],
+                    write: [userId]
+                }
+            })
+        });
+
+        if (content && content.trim() !== '') {
+            await yjsService.initializeTextContent(normalizedPath, content);
+            newFile.size = Buffer.byteLength(content, 'utf8');
+        } else {
+            newFile.size = 0;
+        }
+        await newFile.save();
+
+        await cache.invalidateAllRelatedCaches('file', normalizedPath, userId);
         await applyGroupMemberPermissions(normalizedPath).catch(() => {});
-        respondWithOperation(res, result, 201);
+
+        res.status(201).json({
+            success: true,
+            operation: 'create',
+            message: 'File created successfully',
+            file: {
+                id: newFile._id,
+                filePath: normalizedPath,
+                type: newFile.type
+            },
+            timestamp: new Date().toISOString()
+        });
     }),
 
     /**
@@ -1193,13 +1484,51 @@ const fileController = {
             throw new AppError('Directory already exists.', 409);
         }
 
-        const result = await executeFileOperation('createDir', {
-            dirPath: normalizedDirPath,
-            description
-        }, userId, userRoles);
+        const createDirParentPath = path.posix.dirname(normalizedDirPath);
+        if (createDirParentPath === '/') {
+            throw new AppError('Cannot create directories directly at the filesystem root', 403);
+        }
 
+        const createDirParentWritable = await File.findOneWithWritePermission(
+            { filePath: createDirParentPath, type: 'directory' },
+            userId,
+            userRoles
+        );
+        if (!createDirParentWritable) {
+            throw new AppError('You do not have write permission in the destination directory', 403);
+        }
+
+        const dirOwnerId = await ensureParentDirs(normalizedDirPath, userId);
+        const dirIsGuest = String(dirOwnerId) !== String(userId);
+
+        const newDir = await File.create({
+            filePath: normalizedDirPath,
+            fileName: path.posix.basename(normalizedDirPath),
+            type: 'directory',
+            description: description || 'Created via API request',
+            owner: dirOwnerId,
+            ...(dirIsGuest && {
+                permissions: {
+                    read: [userId],
+                    write: [userId]
+                }
+            })
+        });
+
+        await cache.invalidateAllRelatedCaches('file', normalizedDirPath, userId);
         await applyGroupMemberPermissions(normalizedDirPath).catch(() => {});
-        respondWithOperation(res, result, 201);
+
+        res.status(201).json({
+            success: true,
+            operation: 'createDir',
+            message: 'Directory created successfully',
+            directory: {
+                id: newDir._id,
+                filePath: normalizedDirPath,
+                type: newDir.type
+            },
+            timestamp: new Date().toISOString()
+        });
     }),
 
     /**
@@ -1218,9 +1547,93 @@ const fileController = {
             operationData.force = forceParam === 'true';
         }
 
-        const result = await executeFileOperation('delete', operationData, userId, userRoles);
+        const deleteFile = await File.findOneWithWritePermission(
+            {filePath: decodedFilePath},
+            userId,
+            userRoles
+        );
+        if (!deleteFile) {
+            throw new AppError('File not found or insufficient permissions', 404);
+        }
 
-        respondWithOperation(res, result);
+        if (deleteFile.type === 'directory') {
+            const force = operationData.force !== false;
+            if (force) {
+                const childQuery = {
+                    $or: [
+                        {parentPath: decodedFilePath},
+                        {filePath: new RegExp(`^${decodedFilePath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/`)}
+                    ],
+                    $and: [{
+                        $or: [
+                            {owner: userId},
+                            {'permissions.write': userId}
+                        ]
+                    }]
+                };
+
+                const children = await File.find(childQuery, 'filePath type').lean();
+                await File.deleteMany(childQuery);
+                for (const child of children) {
+                    await cache.invalidateAllRelatedCaches('file', child.filePath, userId);
+                    if (child.type === 'text') {
+                        await yjsService.deleteDocument(child.filePath);
+                    }
+                }
+            } else {
+                const childCount = await File.countDocuments({
+                    parentPath: decodedFilePath,
+                    $or: [
+                        {owner: userId},
+                        {'permissions.read': userId}
+                    ]
+                });
+                if (childCount > 0) {
+                    throw new AppError('Directory is not empty. Use force option to delete with contents.', 400);
+                }
+            }
+        }
+
+        const sharedUsers = deleteFile.getSharedUsers();
+        const affectedUsersDelete = [userId.toString(), ...sharedUsers];
+        await deleteFile.deleteOne();
+
+        if (deleteFile.type === 'text') {
+            await yjsService.deleteDocument(decodedFilePath);
+        }
+
+        await cache.invalidateAllRelatedCaches('file', decodedFilePath, userId);
+        await Promise.all(sharedUsers.map(async (sharedUserId) => {
+            if (sharedUserId === userId.toString()) return;
+            try {
+                await cache.invalidateAllRelatedCaches('file', decodedFilePath, sharedUserId);
+            } catch (cacheError) {
+                logger.warn('Failed to invalidate cache for shared user during delete:', {
+                    sharedUserId,
+                    filePath: decodedFilePath,
+                    error: cacheError.message
+                });
+            }
+        }));
+
+        notificationService.broadcastFileEvent(
+            FILE_EVENTS.FILE_DELETED,
+            {
+                filePath: decodedFilePath,
+                fileName: deleteFile.fileName,
+                fileType: deleteFile.type,
+                userId
+            },
+            affectedUsersDelete
+        );
+
+        res.status(200).json({
+            success: true,
+            operation: 'delete',
+            message: `${deleteFile.type === 'directory' ? 'Directory' : 'File'} deleted successfully`,
+            filePath: decodedFilePath,
+            timestamp: new Date().toISOString()
+        });
     }),
 
     /**
@@ -1239,12 +1652,126 @@ const fileController = {
         const userId = getUserId(req);
         const userRoles = req.user?.roles || [];
 
-        const result = await executeFileOperation('move', {
-            sourcePath: normalizedSource,
-            destinationPath: normalizedDestination
-        }, userId, userRoles);
+        const moveFile = await File.findOneWithWritePermission(
+            {filePath: normalizedSource},
+            userId,
+            userRoles
+        );
+        if (!moveFile) {
+            throw new AppError('Source file not found or insufficient permissions', 404);
+        }
 
-        respondWithOperation(res, result);
+        const moveDestParentPath = path.posix.dirname(normalizedDestination);
+        const moveDestParentWritable = await File.findOneWithWritePermission(
+            { filePath: moveDestParentPath, type: 'directory' },
+            userId,
+            userRoles
+        );
+        if (!moveDestParentWritable) {
+            const moveDestParentExists = await File.exists({ filePath: moveDestParentPath, type: 'directory' });
+            if (moveDestParentExists) {
+                throw new AppError('You do not have write permission in the destination directory', 403);
+            }
+        }
+
+        let yjsBeforeMove = null;
+        if (moveFile.type === 'text') {
+            try {
+                const beforeContent = await yjsService.getTextContent(normalizedSource);
+                yjsBeforeMove = { length: beforeContent.length, preview: beforeContent.slice(0, 80) };
+            } catch (e) {
+                logger.warn('Failed to capture Yjs snapshot before move:', e.message);
+            }
+        }
+
+        const moveOwnerId = await ensureParentDirs(normalizedDestination, userId);
+        if (moveFile.type === 'binary' && moveFile.gridFSId) {
+            try {
+                await renameInGridFS(normalizedSource, normalizedDestination);
+            } catch (error) {
+                logger.error('Failed to rename file in GridFS during move:', error.message);
+            }
+        }
+
+        moveFile.filePath = normalizedDestination;
+        moveFile.owner = moveOwnerId;
+        moveFile.lastModifiedBy = userId;
+        if (String(moveOwnerId) !== String(userId)) {
+            if (!moveFile.permissions.read.some(id => String(id) === String(userId))) {
+                moveFile.permissions.read.push(userId);
+            }
+            if (!moveFile.permissions.write.some(id => String(id) === String(userId))) {
+                moveFile.permissions.write.push(userId);
+            }
+        }
+        await moveFile.save();
+
+        if (moveFile.type === 'directory') {
+            const childCount = await cascadeChildPaths(normalizedSource, normalizedDestination);
+            if (childCount > 0) {
+                logger.info('Cascaded move to children', { oldPath: normalizedSource, newPath: normalizedDestination, childCount });
+            }
+        }
+
+        if (moveFile.type === 'text') {
+            try {
+                await yjsService.moveDocument(normalizedSource, normalizedDestination);
+                const afterContent = await yjsService.getTextContent(normalizedDestination);
+                if (yjsBeforeMove && afterContent.length !== yjsBeforeMove.length) {
+                    logger.warn('YJS move: Content length mismatch after migration', {
+                        beforeLength: yjsBeforeMove.length,
+                        afterLength: afterContent.length,
+                        filePath: normalizedDestination
+                    });
+                }
+            } catch (migrationError) {
+                logger.error('YJS move migration failed, rolling back:', migrationError.message);
+                moveFile.filePath = normalizedSource;
+                await moveFile.save();
+                throw new AppError(`Failed to migrate collaborative document: ${migrationError.message}`, 500);
+            }
+        }
+
+        const sharedUsersMove = moveFile.getSharedUsers();
+        const affectedUsersMove = [userId.toString(), ...sharedUsersMove];
+
+        await cache.invalidateAllRelatedCaches('file', normalizedSource, userId);
+        await cache.invalidateAllRelatedCaches('file', normalizedDestination, userId);
+        await Promise.all(sharedUsersMove.map(async (sharedUserId) => {
+            if (sharedUserId === userId.toString()) return;
+            try {
+                await cache.invalidateAllRelatedCaches('file', normalizedSource, sharedUserId);
+                await cache.invalidateAllRelatedCaches('file', normalizedDestination, sharedUserId);
+            } catch (cacheError) {
+                logger.warn('Failed to invalidate cache for shared user during move:', {
+                    sharedUserId,
+                    oldPath: normalizedSource,
+                    newPath: normalizedDestination,
+                    error: cacheError.message
+                });
+            }
+        }));
+
+        notificationService.broadcastFileEvent(
+            FILE_EVENTS.FILE_MOVED,
+            {
+                oldFilePath: normalizedSource,
+                newFilePath: normalizedDestination,
+                fileName: moveFile.fileName,
+                fileType: moveFile.type,
+                userId
+            },
+            affectedUsersMove
+        );
+
+        res.status(200).json({
+            success: true,
+            operation: 'move',
+            message: 'File moved successfully',
+            oldPath: normalizedSource,
+            newPath: normalizedDestination,
+            timestamp: new Date().toISOString()
+        });
     }),
 
     /**
@@ -1263,12 +1790,96 @@ const fileController = {
         const userId = getUserId(req);
         const userRoles = req.user?.roles || [];
 
-        const result = await executeFileOperation('copy', {
-            sourcePath: normalizedSource,
-            destinationPath: normalizedDestination
-        }, userId, userRoles);
+        const copyFile = await File.findOneWithReadPermission(
+            {filePath: normalizedSource},
+            userId,
+            userRoles
+        );
+        if (!copyFile) {
+            throw new AppError('Source file not found or insufficient permissions', 404);
+        }
 
-        respondWithOperation(res, result, 201);
+        const copyDestParentPath = path.posix.dirname(normalizedDestination);
+        const copyDestParentWritable = await File.findOneWithWritePermission(
+            { filePath: copyDestParentPath, type: 'directory' },
+            userId,
+            userRoles
+        );
+        if (!copyDestParentWritable) {
+            const copyDestParentExists = await File.exists({ filePath: copyDestParentPath, type: 'directory' });
+            if (copyDestParentExists) {
+                throw new AppError('You do not have write permission in the destination directory', 403);
+            }
+        }
+
+        const copyOwnerId = await ensureParentDirs(normalizedDestination, userId);
+        const copyIsGuest = String(copyOwnerId) !== String(userId);
+
+        const copiedFile = await File.create({
+            ...copyFile.toObject(),
+            _id: undefined,
+            filePath: normalizedDestination,
+            fileName: undefined,
+            parentPath: undefined,
+            owner: copyOwnerId,
+            createdAt: new Date(),
+            updatedAt: new Date(),
+            versionHistory: [],
+            ...(copyIsGuest && {
+                permissions: {
+                    read: [userId],
+                    write: [userId]
+                }
+            })
+        });
+
+        if (copyFile.type === 'text') {
+            await yjsService.copyDocument(normalizedSource, normalizedDestination);
+            const textContent = await yjsService.getTextContent(normalizedDestination);
+            copiedFile.size = Buffer.byteLength(textContent, 'utf8');
+            await copiedFile.save();
+        } else if (copyFile.type === 'binary') {
+            const rawContent = await getAndDecompress(copyFile);
+            await compressAndStore(copiedFile, rawContent);
+        }
+
+        const sharedUsersCopy = copyFile.getSharedUsers();
+        const affectedUsersCopy = [userId.toString(), ...sharedUsersCopy];
+        await cache.invalidateAllRelatedCaches('file', normalizedDestination, userId);
+
+        await Promise.all(sharedUsersCopy.map(async (sharedUserId) => {
+            if (sharedUserId === userId.toString()) return;
+            try {
+                await cache.invalidateAllRelatedCaches('file', normalizedDestination, sharedUserId);
+            } catch (cacheError) {
+                logger.warn('Failed to invalidate cache for shared user during copy:', {
+                    sharedUserId,
+                    sourcePath: normalizedSource,
+                    newPath: normalizedDestination,
+                    error: cacheError.message
+                });
+            }
+        }));
+
+        notificationService.broadcastFileEvent(
+            FILE_EVENTS.FILE_CREATED,
+            {
+                filePath: normalizedDestination,
+                fileName: copiedFile.fileName,
+                fileType: copiedFile.type,
+                userId
+            },
+            affectedUsersCopy
+        );
+
+        res.status(201).json({
+            success: true,
+            operation: 'copy',
+            message: 'File copied successfully',
+            oldPath: normalizedSource,
+            newPath: normalizedDestination,
+            timestamp: new Date().toISOString()
+        });
     }),
 
     /**
@@ -1287,12 +1898,130 @@ const fileController = {
         const userId = getUserId(req);
         const userRoles = req.user?.roles || [];
 
-        const result = await executeFileOperation('rename', {
-            filePath: decodedFilePath,
-            newName
-        }, userId, userRoles);
+        const sanitizedNewName = newName.trim();
+        if (sanitizedNewName.includes('/') || sanitizedNewName.includes('\\')) {
+            throw new AppError('File name cannot contain path separators', 400);
+        }
+        if (sanitizedNewName.includes('..')) {
+            throw new AppError('File name cannot contain path traversal characters', 400);
+        }
+        if (sanitizedNewName.match(/[<>:"|?*]/)) {
+            throw new AppError('File name contains invalid characters', 400);
+        }
+        if (sanitizedNewName.length > 255) {
+            throw new AppError('File name too long (maximum 255 characters)', 400);
+        }
 
-        respondWithOperation(res, result);
+        const renameFile = await File.findOneWithWritePermission(
+            {filePath: decodedFilePath},
+            userId,
+            userRoles
+        );
+        if (!renameFile) {
+            throw new AppError('File not found or insufficient permissions', 404);
+        }
+
+        let finalFileName = sanitizedNewName;
+        if (renameFile.type !== 'directory') {
+            const originalExtension = path.extname(renameFile.fileName);
+            const newNameExtension = path.extname(finalFileName);
+            if (originalExtension && !newNameExtension) {
+                finalFileName += originalExtension;
+            }
+        }
+
+        if (finalFileName === renameFile.fileName) {
+            throw new AppError('New name must be different from current name', 400);
+        }
+
+        const parentPath = decodedFilePath.substring(0, decodedFilePath.lastIndexOf('/')) || '/';
+        const renamedFilePath = parentPath === '/' ? `/${finalFileName}` : `${parentPath}/${finalFileName}`;
+
+        const existingFile = await File.findOne({
+            filePath: renamedFilePath,
+            owner: userId
+        });
+        if (existingFile) {
+            throw new AppError('A file with that name already exists', 409);
+        }
+
+        if (renameFile.type === 'binary' && renameFile.gridFSId) {
+            try {
+                await renameInGridFS(decodedFilePath, renamedFilePath);
+            } catch (error) {
+                logger.error('Failed to rename file in GridFS during rename:', {
+                    error: error.message,
+                    decodedFilePath,
+                    renamedFilePath,
+                    userId
+                });
+            }
+        }
+
+        renameFile.filePath = renamedFilePath;
+        await renameFile.save();
+
+        if (renameFile.type === 'directory') {
+            const childCount = await cascadeChildPaths(decodedFilePath, renamedFilePath);
+            if (childCount > 0) {
+                logger.info('Cascaded rename to children', { oldPath: decodedFilePath, newPath: renamedFilePath, childCount });
+            }
+        }
+
+        if (renameFile.type === 'text') {
+            try {
+                await yjsService.moveDocument(decodedFilePath, renamedFilePath);
+            } catch (migrationError) {
+                logger.error('YJS rename migration failed:', {
+                    oldPath: decodedFilePath,
+                    newPath: renamedFilePath,
+                    error: migrationError.message
+                });
+            }
+        }
+
+        const sharedUsersRename = renameFile.getSharedUsers();
+        const affectedUsersRename = [userId.toString(), ...sharedUsersRename];
+        await cache.invalidateAllRelatedCaches('file', decodedFilePath, userId);
+        await cache.invalidateAllRelatedCaches('file', renamedFilePath, userId);
+
+        await Promise.all(sharedUsersRename.map(async (sharedUserId) => {
+            if (sharedUserId === userId.toString()) return;
+            try {
+                await cache.invalidateAllRelatedCaches('file', decodedFilePath, sharedUserId);
+                await cache.invalidateAllRelatedCaches('file', renamedFilePath, sharedUserId);
+            } catch (cacheError) {
+                logger.warn('Failed to invalidate cache for shared user during rename:', {
+                    sharedUserId,
+                    oldPath: decodedFilePath,
+                    newPath: renamedFilePath,
+                    error: cacheError.message
+                });
+            }
+        }));
+
+        notificationService.broadcastFileEvent(
+            FILE_EVENTS.FILE_RENAMED,
+            {
+                oldFilePath: decodedFilePath,
+                newFilePath: renamedFilePath,
+                oldFileName: newName,
+                newFileName: finalFileName,
+                fileType: renameFile.type,
+                userId
+            },
+            affectedUsersRename
+        );
+
+        res.status(200).json({
+            success: true,
+            operation: 'rename',
+            message: 'File renamed successfully',
+            oldPath: decodedFilePath,
+            newPath: renamedFilePath,
+            newName: finalFileName,
+            timestamp: new Date().toISOString()
+        });
     }),
 
     /**
@@ -2807,6 +3536,13 @@ const fileController = {
         // Normalise to eliminate any .. traversal. Permission guards below gate access.
         const effectiveBasePath = path.posix.normalize(basePath || ('/' + req.user.username));
 
+        // Guard: the filesystem root '/' is never a valid upload destination.
+        // It has no MongoDB document so the write-permission check below would silently
+        // pass for it — block it explicitly before reaching that check.
+        if (effectiveBasePath === '/') {
+            throw new AppError('Cannot upload directly to the filesystem root', 403);
+        }
+
         // Guard: user must have write access to the upload destination.
         const uploadDestWritable = await File.findOneWithWritePermission(
             { filePath: effectiveBasePath, type: 'directory' },
@@ -3504,1189 +4240,5 @@ async function cascadeChildPaths(oldDirPath, newDirPath) {
     return children.length;
 }
 
-async function executeFileOperation(operation, data, userId, userRoles = []) {
-    
-    // Extract common data properties once
-    const { filePath, sourcePath, content, message, destinationPath, dirPath } = data;
-    
-    // Determine the effective file path based on operation type (declare outside try block for error logging)
-    // Normalize to NFC to prevent Unicode encoding issues
-    let effectiveFilePath;
-    if (operation === 'copy' || operation === 'move') {
-        effectiveFilePath = sourcePath?.normalize('NFC');
-    } else if (operation === 'createDir') {
-        effectiveFilePath = (dirPath || filePath)?.normalize('NFC');
-    } else {
-        effectiveFilePath = filePath?.normalize('NFC');
-    }
-    
-    try {
-        // Validate input parameters
-        if (!operation || !effectiveFilePath) {
-            return {
-                success: false,
-                error: 'Operation and file path are required',
-                statusCode: 400
-            };
-        }
-        
-        // For operations that require a destination path
-        if ((operation === 'copy' || operation === 'move') && !destinationPath) {
-            return {
-                success: false,
-                error: 'Destination path is required for copy/move operations',
-                statusCode: 400
-            };
-        }
-        
-        switch (operation) {
-            case 'save':
-                // Implement save logic directly since HTTP endpoint was removed
-                const file = await File.findOneWithWritePermission(
-                    {filePath: effectiveFilePath},
-                    userId,
-                    userRoles
-                );
-                
-                if (!file) {
-                    throw new Error('File not found or insufficient permissions');
-                }
-
-                // Validate content is provided for save operation
-                if (content === undefined || content === null) {
-                    throw new Error('Content is required for save operation');
-                }
-                
-                if (file.type === 'text') {
-                    logger.error('TEXT FILE HTTP SAVE REJECTED', {
-                        userId,
-                        filePath: effectiveFilePath,
-                        fileType: file.type
-                    });
-                    throw new AppError('Text files cannot be saved via HTTP API. Use WebSocket collaborative editing instead.', 400);
-                } else {
-                    // For binary files, pass raw content directly - compressAndStore will handle encoding
-                    await compressAndStore(file, content);
-                }
-                
-                // Clear cache using comprehensive cache invalidation
-                await cache.invalidateAllRelatedCaches('file', effectiveFilePath, userId);
-                
-                const saveResult = { 
-                    success: true, 
-                    operation: 'save',
-                    message: 'File content saved successfully',
-                    version: file.version,
-                    filePath: effectiveFilePath,
-                    fileType: file.type,
-                    size: file.size,
-                    timestamp: new Date().toISOString()
-                };
-                
-                return saveResult;
-                
-            case 'getContent':
-                // Implement getContent logic directly since HTTP endpoint was removed
-                const getFile = await File.findOneWithReadPermission(
-                    {filePath: effectiveFilePath},
-                    userId,
-                    userRoles
-                );
-                
-                if (!getFile) {
-                    throw new Error('File not found or access denied');
-                }
-                
-                const fileContent = await getAndDecompress(getFile);
-                
-                const contentResult = { 
-                    success: true, 
-                    operation: 'getContent',
-                    content: fileContent,
-                    fileType: getFile.type,
-                    size: getFile.size,
-                    mimeType: getFile.mimeType,
-                    lastModified: getFile.updatedAt,
-                    owner: getFile.owner.toString(),
-                    version: getFile.version,
-                    filePath: effectiveFilePath,
-                    timestamp: new Date().toISOString()
-                };
-                
-                return contentResult;
-                
-            case 'getMetadata':
-                // Implement getMetadata logic directly since HTTP endpoint was removed
-                const metaFile = await File.findOneWithReadPermission(
-                    {filePath: effectiveFilePath},
-                    userId,
-                    userRoles
-                );
-                
-                if (!metaFile) {
-                    throw new Error('File not found or access denied');
-                }
-
-                // Use MongoDB timestamp only - avoid Yjs metadata calls that can affect timestamps
-                // Only use metaFile.updatedAt for consistent, non-interfering metadata display
-                const effectiveUpdatedAt = metaFile.updatedAt;
-                
-                // Use stored size directly — computing live Yjs byte-length loads the
-                // entire document from MongoDB on every metadata request, which is the
-                // main reason the file viewer takes seconds to open.  The stored size
-                // is updated by the 3-second metadata debounce in bindState anyway.
-                // Add version storage: sum all saved version sizes on top of the working file size.
-                const versionStorageSize = metaFile.versionHistory.reduce((sum, v) => sum + (v.size || 0), 0);
-                const size = metaFile.size + versionStorageSize;
-                
-                const metadataResult = {
-                    success: true,
-                    operation: 'getMetadata',
-                    _id: metaFile._id,
-                    filePath: metaFile.filePath,
-                    fileName: metaFile.fileName,
-                    type: metaFile.type,
-                    mimeType: metaFile.mimeType,
-                    size,
-                    owner: metaFile.owner,
-                    tags: metaFile.tags,
-                    description: metaFile.description,
-                    permissions: metaFile.permissions,
-                    version: metaFile.version,
-                    versionHistory: metaFile.versionHistory,
-                    createdAt: metaFile.createdAt,
-                    updatedAt: effectiveUpdatedAt, // Use enhanced last modified time
-                    lastModifiedBy: metaFile.lastModifiedBy,
-                    mediaMetadata: metaFile.mediaMetadata || null, // Include media metadata for audio/video files
-                    timestamp: new Date().toISOString()
-                };
-                
-                return metadataResult;
-                
-            case 'updateMetadata':
-                // Implement updateMetadata logic directly since HTTP endpoint was removed
-                const updateFile = await File.findOneWithWritePermission(
-                    {filePath: effectiveFilePath},
-                    userId,
-                    userRoles
-                );
-                
-                if (!updateFile) {
-                    throw new Error('File not found or access denied');
-                }
-                
-                const updateMetadata = data.updateMetadata || {};
-                let hasChanges = false;
-                const updates = {};
-                
-                // Handle description update
-                if (updateMetadata.description !== undefined && updateMetadata.description !== updateFile.description) {
-                    updates.description = updateMetadata.description;
-                    hasChanges = true;
-                }
-                
-                // Handle tags update
-                if (updateMetadata.tags !== undefined && JSON.stringify(updateMetadata.tags) !== JSON.stringify(updateFile.tags)) {
-                    updates.tags = updateMetadata.tags;
-                    hasChanges = true;
-                }
-                
-                // Handle permissions update (admin only for now)
-                if (updateMetadata.permissions !== undefined && userRoles.includes('admin')) {
-                    updates.permissions = updateMetadata.permissions;
-                    hasChanges = true;
-                }
-                
-                if (hasChanges) {
-                    updates.updatedAt = new Date();
-                    updates.lastModifiedBy = userId;
-                    
-                    await File.updateOne({_id: updateFile._id}, updates);
-                    
-                    // Refresh the file to get updated data
-                    const updatedFile = await File.findById(updateFile._id);
-                    
-                    return {
-                        success: true,
-                        operation: 'updateMetadata',
-                        metadata: {
-                            _id: updatedFile._id,
-                            filePath: updatedFile.filePath,
-                            fileName: updatedFile.fileName,
-                            type: updatedFile.type,
-                            mimeType: updatedFile.mimeType,
-                            size: updatedFile.size,
-                            owner: updatedFile.owner,
-                            tags: updatedFile.tags,
-                            description: updatedFile.description,
-                            permissions: updatedFile.permissions,
-                            version: updatedFile.version,
-                            versionHistory: updatedFile.versionHistory,
-                            createdAt: updatedFile.createdAt,
-                            updatedAt: updatedFile.updatedAt,
-                            lastModifiedBy: updatedFile.lastModifiedBy
-                        },
-                        timestamp: new Date().toISOString()
-                    };
-                } else {
-                    return {
-                        success: true,
-                        operation: 'updateMetadata',
-                        message: 'No changes to apply',
-                        metadata: {
-                            _id: updateFile._id,
-                            filePath: updateFile.filePath,
-                            fileName: updateFile.fileName,
-                            type: updateFile.type,
-                            mimeType: updateFile.mimeType,
-                            size: updateFile.size,
-                            owner: updateFile.owner,
-                            tags: updateFile.tags,
-                            description: updateFile.description,
-                            permissions: updateFile.permissions,
-                            version: updateFile.version,
-                            versionHistory: updateFile.versionHistory,
-                            createdAt: updateFile.createdAt,
-                            updatedAt: updateFile.updatedAt,
-                            lastModifiedBy: updateFile.lastModifiedBy
-                        },
-                        timestamp: new Date().toISOString()
-                    };
-                }
-                
-            case 'saveVersion':
-                // Create a version snapshot directly from existing file content
-                // Version saving works independently without requiring an HTTP content update
-                const versionFile = await File.findOneWithWritePermission(
-                    {filePath: effectiveFilePath},
-                    userId,
-                    userRoles
-                );
-                
-                if (!versionFile) {
-                    throw new Error('File not found or insufficient permissions');
-                }
-                
-                const versionMessage = message || `Saved at ${new Date().toLocaleString()}`;
-                const updatedFile = await versionFile.createVersionSnapshot(userId, versionMessage, (path) => yjsService.getTextContent(path));
-                
-                const totalVersions = updatedFile.versionHistory.length;
-                // Latest version number is last index + 1 (sequential numbering)
-                const versionNumber = totalVersions;
-                
-                return { 
-                    success: true, 
-                    operation: 'saveVersion',
-                    message: `Version ${versionNumber} saved successfully`,
-                    versionNumber: versionNumber, // Latest version is always 1
-                    versionCount: totalVersions,
-                    filePath: effectiveFilePath,
-                    timestamp: new Date().toISOString()
-                };
-                
-            case 'getVersions':
-                // Get file versions via WebSocket
-                const versionsFile = await File.findOneWithReadPermission(
-                    {filePath: effectiveFilePath},
-                    userId,
-                    userRoles
-                );
-                
-                if (!versionsFile) {
-                    throw new Error('File not found or insufficient permissions');
-                }
-                
-                // Transform version history to include computed version numbers (sequential)
-                const transformedVersions = versionsFile.versionHistory.map((version, index) => ({
-                    ...version.toObject(),
-                    version: index + 1, // Sequential version numbering
-                    isCurrent: index === versionsFile.versionHistory.length - 1, // Latest version is at end
-                    createdAt: version.timestamp,
-                    size: version.size || 0
-                }));
-                
-                return { 
-                    success: true, 
-                    operation: 'getVersions',
-                    message: 'File versions retrieved successfully',
-                    versions: transformedVersions,
-                    totalVersions: versionsFile.versionHistory.length,
-                    filePath: effectiveFilePath,
-                    timestamp: new Date().toISOString()
-                };
-                
-            case 'create':
-                // Guard: user must have write access to the immediate parent directory.
-                const createParentPath = path.posix.dirname(effectiveFilePath);
-                const createParentWritable = await File.findOneWithWritePermission(
-                    { filePath: createParentPath, type: 'directory' },
-                    userId, userRoles
-                );
-                if (!createParentWritable) {
-                    const createParentExists = await File.exists({ filePath: createParentPath, type: 'directory' });
-                    if (createParentExists) {
-                        return {
-                            success: false,
-                            error: 'You do not have write permission in the destination directory',
-                            statusCode: 403
-                        };
-                    }
-                }
-
-                // Ensure parent directories exist (returns resolved workspace owner)
-                const createOwnerId = await ensureParentDirs(effectiveFilePath, userId);
-                const createIsGuest = String(createOwnerId) !== String(userId);
-
-                // Create new file (content is optional - empty files are allowed)
-                const createFileData = {
-                    filePath: effectiveFilePath,
-                    type: 'text',
-                    description: message || 'Created via API request',
-                    owner: createOwnerId,
-                    ...(createIsGuest && {
-                        permissions: {
-                            read: [userId],
-                            write: [userId]
-                        }
-                    })
-                };
-                
-                const newFile = await File.create(createFileData);
-                
-                // Handle content initialization
-                if (newFile.type === 'text') {
-                    if (content && content.trim() !== '') {
-                        // Initialize Yjs document with content (ONLY legitimate HTTP-to-Yjs write)
-                        await yjsService.initializeTextContent(effectiveFilePath, content);
-                        newFile.size = Buffer.byteLength(content, 'utf8');
-                    } else {
-                        // Text files created empty - content added via WebSocket collaborative editing
-                        newFile.size = 0;
-                    }
-                    await newFile.save();
-                } else if (content) {
-                    // For binary files, only store if content is provided
-                    await compressAndStore(newFile, content);
-                }
-                
-                // Clear all related caches using comprehensive cache invalidation
-                await cache.invalidateAllRelatedCaches('file', effectiveFilePath, userId);
-                
-                return {
-                    success: true,
-                    operation: 'create',
-                    message: 'File created successfully',
-                    file: {
-                        id: newFile._id,
-                        filePath: effectiveFilePath,
-                        type: newFile.type
-                    },
-                    timestamp: new Date().toISOString()
-                };
-                
-            case 'createDir':
-                // Create new directory (use consistent filePath parameter)
-                const dirPath = data.dirPath || data.filePath; // Accept both for compatibility
-                if (!dirPath) {
-                    throw new Error('Directory path is required');
-                }
-                
-                // Use directory path directly (no decoding needed for WebSocket)
-                const normalizedDirPath = dirPath.replace(/\/$/, '') || '/';
-
-                // Guard: user must have write access to the immediate parent directory
-                const createDirParentPath = path.posix.dirname(normalizedDirPath);
-                const createDirParentWritable = await File.findOneWithWritePermission(
-                    { filePath: createDirParentPath, type: 'directory' },
-                    userId, userRoles
-                );
-                if (!createDirParentWritable) {
-                    const createDirParentExists = await File.exists({ filePath: createDirParentPath, type: 'directory' });
-                    if (createDirParentExists) {
-                        return {
-                            success: false,
-                            error: 'You do not have write permission in the destination directory',
-                            statusCode: 403
-                        };
-                    }
-                }
-
-                // Ensure parent directories exist (resolves workspace owner internally)
-                const dirOwnerId = await ensureParentDirs(normalizedDirPath, userId);
-                const dirIsGuest = String(dirOwnerId) !== String(userId);
-                
-                const createDirData = {
-                    filePath: normalizedDirPath,
-                    fileName: path.posix.basename(normalizedDirPath),
-                    type: 'directory',
-                    description: data.description || 'Created via API request',
-                    owner: dirOwnerId,
-                    ...(dirIsGuest && {
-                        permissions: {
-                            read: [userId],
-                            write: [userId]
-                        }
-                    })
-                };
-                
-                const newDir = await File.create(createDirData);
-                
-                // Clear all related caches using comprehensive cache invalidation
-                await cache.invalidateAllRelatedCaches('file', normalizedDirPath, userId);
-                
-                return {
-                    success: true,
-                    operation: 'createDir',
-                    message: 'Directory created successfully',
-                    directory: {
-                        id: newDir._id,
-                        filePath: dirPath,
-                        type: newDir.type
-                    },
-                    timestamp: new Date().toISOString()
-                };
-                
-            case 'delete':
-                // Delete file or directory with cascading support
-                const deleteFile = await File.findOneWithWritePermission(
-                    {filePath: effectiveFilePath},
-                    userId,
-                    userRoles
-                );
-                
-                if (!deleteFile) {
-                    throw new Error('File not found or insufficient permissions');
-                }
-
-                // If it's a directory, handle cascading deletion
-                if (deleteFile.type === 'directory') {
-                    // Get force flag from data (default to true for WebSocket since it's explicit user action)
-                    const force = data.force !== false; // Default to true unless explicitly false
-                    
-                    if (force) {
-                        // Recursive deletion - delete all children first
-                        const childQuery = {
-                            $or: [
-                                {parentPath: effectiveFilePath},
-                                {filePath: new RegExp(`^${effectiveFilePath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/`)}
-                            ],
-                            $and: [{
-                                $or: [
-                                    {owner: userId}, // Owner can delete
-                                    {'permissions.write': userId} // User has explicit write permission
-                                ]
-                            }]
-                        };
-
-                        // Get all children for cache and Yjs cleanup
-                        const children = await File.find(childQuery, 'filePath type').lean();
-
-                        // Delete all children in one operation
-                        await File.deleteMany(childQuery);
-
-                        // Clear caches and Yjs documents for all deleted files
-                        for (const child of children) {
-                            await cache.invalidateAllRelatedCaches('file', child.filePath, userId);
-                            if (child.type === 'text') {
-                                await yjsService.deleteDocument(child.filePath);
-                            }
-                        }
-                    } else {
-                        // Check if directory is empty
-                        const childCount = await File.countDocuments({
-                            parentPath: effectiveFilePath,
-                            $or: [
-                                {owner: userId},
-                                {'permissions.read': userId}
-                            ]
-                        });
-
-                        if (childCount > 0) {
-                            throw new Error('Directory is not empty. Use force option to delete with contents.');
-                        }
-                    }
-                }
-                
-                // Get shared users before deletion for cache invalidation and notifications
-                const sharedUsers = deleteFile.getSharedUsers();
-                const affectedUsersDelete = [userId.toString(), ...sharedUsers];
-                
-                // Delete the file/directory itself
-                await deleteFile.deleteOne();
-
-                // Purge the Yjs document so re-created files don't load stale content
-                if (deleteFile.type === 'text') {
-                    await yjsService.deleteDocument(effectiveFilePath);
-                }
-
-                // Clear all related caches for owner
-                await cache.invalidateAllRelatedCaches('file', effectiveFilePath, userId);
-                
-                // Clear caches for all shared users (collaborators)
-                await Promise.all(sharedUsers.map(async (sharedUserId) => {
-                    if (sharedUserId === userId.toString()) return; // Skip owner, already done
-                    try {
-                        await cache.invalidateAllRelatedCaches('file', effectiveFilePath, sharedUserId);
-                    } catch (cacheError) {
-                        logger.warn('Failed to invalidate cache for shared user during delete:', {
-                            sharedUserId,
-                            filePath: effectiveFilePath,
-                            error: cacheError.message
-                        });
-                    }
-                }));
-                
-                // Broadcast notification to all affected users (file already deleted, pass users directly)
-                notificationService.broadcastFileEvent(
-                    FILE_EVENTS.FILE_DELETED,
-                    {
-                        filePath: effectiveFilePath,
-                        fileName: deleteFile.fileName,
-                        fileType: deleteFile.type,
-                        userId
-                    },
-                    affectedUsersDelete
-                );
-                
-                return {
-                    success: true,
-                    operation: 'delete',
-                    message: `${deleteFile.type === 'directory' ? 'Directory' : 'File'} deleted successfully`,
-                    filePath: effectiveFilePath,
-                    timestamp: new Date().toISOString()
-                };
-                
-            case 'move':
-                // Move file or directory
-                const moveFile = await File.findOneWithWritePermission(
-                    {filePath: sourcePath},
-                    userId,
-                    userRoles
-                );
-                
-                if (!moveFile) {
-                    throw new Error('Source file not found or insufficient permissions');
-                }
-                
-                // destinationPath is the full target path (directory + filename) sent by the client
-                const newFilePath = destinationPath;
-
-                // Guard: user must have write access to the destination parent directory
-                const moveDestParentPath = path.posix.dirname(newFilePath);
-                const moveDestParentWritable = await File.findOneWithWritePermission(
-                    { filePath: moveDestParentPath, type: 'directory' },
-                    userId, userRoles
-                );
-                if (!moveDestParentWritable) {
-                    const moveDestParentExists = await File.exists({ filePath: moveDestParentPath, type: 'directory' });
-                    if (moveDestParentExists) {
-                        return {
-                            success: false,
-                            error: 'You do not have write permission in the destination directory',
-                            statusCode: 403
-                        };
-                    }
-                }
-                
-                // For text files, capture Yjs snapshot before path change
-                let yjsBeforeMove = null;
-                if (moveFile.type === 'text') {
-                    try {
-                        const beforeContent = await yjsService.getTextContent(sourcePath);
-                        yjsBeforeMove = { length: beforeContent.length, preview: beforeContent.slice(0, 80) };
-                    } catch (e) {
-                        // Failed to read before snapshot - continue anyway
-                        logger.warn('Failed to capture Yjs snapshot before move:', e.message);
-                    }
-                }
-
-                // Ensure parent directories exist for the new path
-                // Resolve destination workspace owner — if moving across workspaces,
-                // the file should become owned by the destination workspace user.
-                const moveOwnerId = await ensureParentDirs(newFilePath, userId);
-                
-                // For binary files, rename in GridFS before updating the database record
-                if (moveFile.type === 'binary' && moveFile.gridFSId) {
-                    try {
-                        await renameInGridFS(sourcePath, newFilePath);
-                    } catch (error) {
-                        // Don't fail the operation, but log the issue
-                        logger.error('Failed to rename file in GridFS during move:', error.message);
-                    }
-                }
-                
-                // Update the file path, owner, and last modifier
-                moveFile.filePath = newFilePath;
-                moveFile.owner = moveOwnerId;
-                moveFile.lastModifiedBy = userId;
-                // Ensure the actor keeps read+write access after the move
-                if (String(moveOwnerId) !== String(userId)) {
-                    if (!moveFile.permissions.read.some(id => String(id) === String(userId))) {
-                        moveFile.permissions.read.push(userId);
-                    }
-                    if (!moveFile.permissions.write.some(id => String(id) === String(userId))) {
-                        moveFile.permissions.write.push(userId);
-                    }
-                }
-                await moveFile.save();
-
-                // For directories, cascade-update all children regardless of owner
-                if (moveFile.type === 'directory') {
-                    const childCount = await cascadeChildPaths(sourcePath, newFilePath);
-                    if (childCount > 0) {
-                        logger.info('Cascaded move to children', { oldPath: sourcePath, newPath: newFilePath, childCount });
-                    }
-                }
-
-                // For text files, migrate Yjs doc and active sessions from old path to new path
-                if (moveFile.type === 'text') {
-                    try {
-                        await yjsService.moveDocument(sourcePath, newFilePath);
-                        
-                        // Verify migration succeeded
-                        const afterContent = await yjsService.getTextContent(newFilePath);
-                        
-                        // Verify content integrity
-                        if (yjsBeforeMove && afterContent.length !== yjsBeforeMove.length) {
-                            logger.warn('YJS move: Content length mismatch after migration', {
-                                beforeLength: yjsBeforeMove.length,
-                                afterLength: afterContent.length,
-                                filePath: newFilePath
-                            });
-                        }
-                    } catch (migrationError) {
-                        // Rollback file metadata changes if Yjs migration failed
-                        logger.error('YJS move migration failed, rolling back:', migrationError.message);
-                        
-                        moveFile.filePath = sourcePath;
-                        await moveFile.save();
-                        
-                        throw new Error(`Failed to migrate collaborative document: ${migrationError.message}`);
-                    }
-                }
-                
-                // Get shared users for cache invalidation and notifications
-                const sharedUsersMove = moveFile.getSharedUsers();
-                const affectedUsersMove = [userId.toString(), ...sharedUsersMove];
-                
-                // Clear all related caches for both source and destination paths (owner)
-                await cache.invalidateAllRelatedCaches('file', sourcePath, userId);
-                await cache.invalidateAllRelatedCaches('file', newFilePath, userId);
-                
-                // Clear caches for all shared users (collaborators)
-                await Promise.all(sharedUsersMove.map(async (sharedUserId) => {
-                    if (sharedUserId === userId.toString()) return; // Skip owner, already done
-                    try {
-                        await cache.invalidateAllRelatedCaches('file', sourcePath, sharedUserId);
-                        await cache.invalidateAllRelatedCaches('file', newFilePath, sharedUserId);
-                    } catch (cacheError) {
-                        logger.warn('Failed to invalidate cache for shared user during move:', {
-                            sharedUserId,
-                            oldPath: sourcePath,
-                            newPath: newFilePath,
-                            error: cacheError.message
-                        });
-                    }
-                }));
-                
-                // Broadcast notification to all affected users (pass users directly)
-                notificationService.broadcastFileEvent(
-                    FILE_EVENTS.FILE_MOVED,
-                    {
-                        oldFilePath: sourcePath,
-                        newFilePath: newFilePath,
-                        fileName: moveFile.fileName,
-                        fileType: moveFile.type,
-                        userId
-                    },
-                    affectedUsersMove
-                );
-                
-                return {
-                    success: true,
-                    operation: 'move',
-                    message: 'File moved successfully',
-                    oldPath: sourcePath,
-                    newPath: newFilePath,
-                    timestamp: new Date().toISOString()
-                };
-                
-            case 'copy':
-                // Copy file or directory
-                
-                const copyFile = await File.findOneWithReadPermission(
-                    {filePath: sourcePath},
-                    userId,
-                    userRoles
-                );
-                
-                if (!copyFile) {
-                    throw new Error('Source file not found or insufficient permissions');
-                }
-                
-                // destinationPath is the full target path (directory + filename) sent by the client
-                const copyNewFilePath = destinationPath;
-
-                // Guard: user must have write access to the destination parent directory
-                const copyDestParentPath = path.posix.dirname(copyNewFilePath);
-                const copyDestParentWritable = await File.findOneWithWritePermission(
-                    { filePath: copyDestParentPath, type: 'directory' },
-                    userId, userRoles
-                );
-                if (!copyDestParentWritable) {
-                    const copyDestParentExists = await File.exists({ filePath: copyDestParentPath, type: 'directory' });
-                    if (copyDestParentExists) {
-                        return {
-                            success: false,
-                            error: 'You do not have write permission in the destination directory',
-                            statusCode: 403
-                        };
-                    }
-                }
-                
-                // Ensure parent directories exist (returns resolved workspace owner)
-                const copyOwnerId = await ensureParentDirs(copyNewFilePath, userId);
-                const copyIsGuest = String(copyOwnerId) !== String(userId);
-                
-                const copyData = {
-                    ...copyFile.toObject(),
-                    _id: undefined,
-                    filePath: copyNewFilePath,
-                    // Remove these so pre-save middleware can calculate them from filePath
-                    fileName: undefined,
-                    parentPath: undefined,
-                    owner: copyOwnerId,
-                    createdAt: new Date(),
-                    updatedAt: new Date(),
-                    versionHistory: [],
-                    ...(copyIsGuest && {
-                        permissions: {
-                            read: [userId],
-                            write: [userId]
-                        }
-                    })
-                };
-                
-                const copiedFile = await File.create(copyData);
-                
-                if (copyFile.type === 'text') {
-                    // For text files, copy Yjs document content if it exists
-                    await yjsService.copyDocument(sourcePath, copyNewFilePath);
-                    const textContent = await yjsService.getTextContent(copyNewFilePath);
-                    
-                    // Update file size to match content
-                    copiedFile.size = Buffer.byteLength(textContent, 'utf8');
-                    await copiedFile.save();
-                } else if (copyFile.type === 'binary') {
-                    // For binary files, get raw content and compress/store
-                    const rawContent = await getAndDecompress(copyFile);
-                    await compressAndStore(copiedFile, rawContent);
-                }
-                // Directories don't need content handling
-                
-                // Get shared users from source file for cache invalidation and notifications
-                const sharedUsersCopy = copyFile.getSharedUsers();
-                const affectedUsersCopy = [userId.toString(), ...sharedUsersCopy];
-                
-                // Clear all related caches for the destination path (owner)
-                await cache.invalidateAllRelatedCaches('file', copyNewFilePath, userId);
-                
-                // Clear caches for all shared users of the source file (collaborators)
-                await Promise.all(sharedUsersCopy.map(async (sharedUserId) => {
-                    if (sharedUserId === userId.toString()) return; // Skip owner, already done
-                    try {
-                        await cache.invalidateAllRelatedCaches('file', copyNewFilePath, sharedUserId);
-                    } catch (cacheError) {
-                        logger.warn('Failed to invalidate cache for shared user during copy:', {
-                            sharedUserId,
-                            sourcePath: sourcePath,
-                            newPath: copyNewFilePath,
-                            error: cacheError.message
-                        });
-                    }
-                }));
-                
-                // Broadcast notification to all affected users (copy creates a new file, pass users directly)
-                notificationService.broadcastFileEvent(
-                    FILE_EVENTS.FILE_CREATED,
-                    {
-                        filePath: copyNewFilePath,
-                        fileName: copiedFile.fileName,
-                        fileType: copiedFile.type,
-                        userId
-                    },
-                    affectedUsersCopy
-                );
-                
-                return {
-                    success: true,
-                    operation: 'copy',
-                    message: 'File copied successfully',
-                    oldPath: sourcePath,
-                    newPath: copyNewFilePath,
-                    timestamp: new Date().toISOString()
-                };
-                
-            case 'loadVersion':
-                // Load a specific version for read-only viewing (does NOT overwrite current content)
-                const { versionNumber: loadVersionNum } = data;
-                if (!loadVersionNum) {
-                    throw new Error('Version number is required');
-                }
-                
-                const loadVersionFile = await File.findOneWithReadPermission(
-                    {filePath: effectiveFilePath},
-                    userId,
-                    userRoles
-                );
-                
-                if (!loadVersionFile) {
-                    throw new Error('File not found or insufficient permissions');
-                }
-                
-                // Convert version number to array index (sequential numbering)
-                const loadVersionNumber = parseInt(loadVersionNum);
-                const loadVersionIndex = loadVersionNumber - 1;
-                
-                // Check if version exists at the computed index
-                if (loadVersionIndex < 0 || loadVersionIndex >= loadVersionFile.versionHistory.length) {
-                    throw new Error(`Version ${loadVersionNum} not found`);
-                }
-                
-                const versionToLoad = loadVersionFile.versionHistory[loadVersionIndex];
-                
-                // Get version content using the model method (which now only uses GridFS)
-                const versionContent = await loadVersionFile.getVersionContent(loadVersionNumber);
-                
-                // Decode content for client (since version content is stored as base64)
-                const clientContent = versionContent ? Buffer.from(versionContent, 'base64').toString('utf8') : '';
-                
-                // Return version content WITHOUT modifying current working version
-                return {
-                    success: true,
-                    operation: 'loadVersion',
-                    message: `Version ${loadVersionNum} loaded for viewing (current version unchanged)`,
-                    content: clientContent,
-                    versionNumber: loadVersionNumber,
-                    versionTimestamp: versionToLoad.timestamp,
-                    versionMessage: versionToLoad.message,
-                    currentVersion: loadVersionFile.version, // Show current version is unchanged
-                    filePath: effectiveFilePath,
-                    timestamp: new Date().toISOString(),
-                    readOnly: true // Indicate this is read-only content
-                };
-                
-            case 'downloadVersion':
-                // Download a specific version as a file
-                const { versionNumber: downloadVersionNum } = data;
-                if (!downloadVersionNum) {
-                    throw new Error('Version number is required');
-                }
-                
-                const downloadVersionFile = await File.findOneWithReadPermission(
-                    {filePath: effectiveFilePath},
-                    userId,
-                    userRoles
-                );
-                
-                if (!downloadVersionFile) {
-                    throw new Error('File not found or insufficient permissions');
-                }
-                
-                // Convert version number to array index (sequential numbering)
-                const downloadVersionNumber = parseInt(downloadVersionNum);
-                const downloadVersionIndex = downloadVersionNumber - 1;
-                
-                // Check if version exists at the computed index
-                if (downloadVersionIndex < 0 || downloadVersionIndex >= downloadVersionFile.versionHistory.length) {
-                    throw new Error(`Version ${downloadVersionNum} not found`);
-                }
-                
-                const versionToDownload = downloadVersionFile.versionHistory[downloadVersionIndex];
-                
-                // Get version content from GridFS
-                const downloadVersionContent = await downloadVersionFile.getVersionContent(downloadVersionNumber);
-                
-                // Convert base64 to buffer for download
-                const contentBuffer = Buffer.from(downloadVersionContent, 'base64');
-                
-                // Return buffer with metadata for download
-                return {
-                    success: true,
-                    operation: 'downloadVersion',
-                    content: contentBuffer,
-                    fileName: downloadVersionFile.fileName,
-                    mimeType: downloadVersionFile.mimeType || 'application/octet-stream',
-                    filePath: effectiveFilePath,
-                    versionNumber: downloadVersionNumber
-                };
-                
-            case 'deleteVersion':
-                // Delete a specific version
-                const { versionNumber: deleteVersionNum } = data;
-                if (!deleteVersionNum) {
-                    throw new Error('Version number is required');
-                }
-                
-                const deleteVersionFile = await File.findOneWithWritePermission(
-                    {filePath: effectiveFilePath},
-                    userId,
-                    userRoles
-                );
-                
-                if (!deleteVersionFile) {
-                    throw new Error('File not found or insufficient permissions');
-                }
-                
-                // Use the model's deleteVersion method
-                const deleteResult = await deleteVersionFile.deleteVersion(parseInt(deleteVersionNum), userId);
-                
-                // Clear related caches
-                await cache.invalidateAllRelatedCaches('file', effectiveFilePath, userId);
-                
-                return {
-                    success: true,
-                    operation: 'deleteVersion',
-                    message: deleteResult.message,
-                    remainingVersions: deleteResult.remainingVersions,
-                    filePath: effectiveFilePath,
-                    timestamp: new Date().toISOString()
-                };
-                
-            case 'rename':
-                // Rename file or directory (only changes filename within same directory)
-                const { newName } = data;
-                if (!newName || !newName.trim()) {
-                    throw new Error('New name is required for rename operation');
-                }
-                
-                // Validate new name for security and path restrictions
-                const sanitizedNewName = newName.trim();
-                if (sanitizedNewName.includes('/') || sanitizedNewName.includes('\\')) {
-                    throw new Error('File name cannot contain path separators');
-                }
-                if (sanitizedNewName.includes('..')) {
-                    throw new Error('File name cannot contain path traversal characters');
-                }
-                if (sanitizedNewName.match(/[<>:"|?*]/)) {
-                    throw new Error('File name contains invalid characters');
-                }
-                if (sanitizedNewName.length > 255) {
-                    throw new Error('File name too long (maximum 255 characters)');
-                }
-                
-                const renameFile = await File.findOneWithWritePermission(
-                    {filePath: effectiveFilePath},
-                    userId,
-                    userRoles
-                );
-                
-                if (!renameFile) {
-                    throw new Error('File not found or insufficient permissions');
-                }
-                
-                // Preserve file extension if not provided for files
-                let finalFileName = sanitizedNewName;
-                if (renameFile.type !== 'directory') {
-                    const originalExtension = path.extname(renameFile.fileName);
-                    const newNameExtension = path.extname(finalFileName);
-                    
-                    if (originalExtension && !newNameExtension) {
-                        finalFileName = finalFileName + originalExtension;
-                    }
-                }
-                
-                // Check if name is actually different
-                if (finalFileName === renameFile.fileName) {
-                    throw new Error('New name must be different from current name');
-                }
-                
-                // Extract parent directory and create new path
-                const parentPath = effectiveFilePath.substring(0, effectiveFilePath.lastIndexOf('/')) || '/';
-                const renamedFilePath = parentPath === '/' ? `/${finalFileName}` : `${parentPath}/${finalFileName}`;
-                
-                // Check if destination already exists
-                const existingFile = await File.findOne({
-                    filePath: renamedFilePath,
-                    owner: userId
-                });
-                
-                if (existingFile) {
-                    throw new Error('A file with that name already exists');
-                }
-                
-                // For binary files, rename in GridFS before updating the database record
-                if (renameFile.type === 'binary' && renameFile.gridFSId) {
-                    try {
-                        await renameInGridFS(effectiveFilePath, renamedFilePath);
-                    } catch (error) {
-                        logger.error('Failed to rename file in GridFS during rename:', {
-                            error: error.message,
-                            effectiveFilePath,
-                            renamedFilePath,
-                            userId
-                        });
-                        // Don't fail the operation, but log the issue
-                    }
-                }
-                
-                // Update the file path - fileName and parentPath will be auto-calculated by the model
-                renameFile.filePath = renamedFilePath;
-                await renameFile.save();
-
-                // For directories, cascade-update all children
-                if (renameFile.type === 'directory') {
-                    const childCount = await cascadeChildPaths(effectiveFilePath, renamedFilePath, userId);
-                    if (childCount > 0) {
-                        logger.info('Cascaded rename to children', { oldPath: effectiveFilePath, newPath: renamedFilePath, childCount });
-                    }
-                }
-
-                // For text files, migrate Yjs doc and active sessions from old path to new path
-                if (renameFile.type === 'text') {
-                    try {
-                        await yjsService.moveDocument(effectiveFilePath, renamedFilePath);
-                    } catch (migrationError) {
-                        logger.error('YJS rename migration failed:', {
-                            oldPath: effectiveFilePath, 
-                            newPath: renamedFilePath, 
-                            error: migrationError.message
-                        });
-                        // Continue despite migration error - file rename still succeeded
-                    }
-                }
-                
-                // Get shared users for cache invalidation and notifications
-                const sharedUsersRename = renameFile.getSharedUsers();
-                const affectedUsersRename = [userId.toString(), ...sharedUsersRename];
-                
-                // Clear all related caches for both old and new paths (owner)
-                await cache.invalidateAllRelatedCaches('file', effectiveFilePath, userId);
-                await cache.invalidateAllRelatedCaches('file', renamedFilePath, userId);
-                
-                // Clear caches for all shared users (collaborators)
-                await Promise.all(sharedUsersRename.map(async (sharedUserId) => {
-                    if (sharedUserId === userId.toString()) return; // Skip owner, already done
-                    try {
-                        await cache.invalidateAllRelatedCaches('file', effectiveFilePath, sharedUserId);
-                        await cache.invalidateAllRelatedCaches('file', renamedFilePath, sharedUserId);
-                    } catch (cacheError) {
-                        logger.warn('Failed to invalidate cache for shared user during rename:', {
-                            sharedUserId,
-                            oldPath: effectiveFilePath,
-                            newPath: renamedFilePath,
-                            error: cacheError.message
-                        });
-                    }
-                }));
-                
-                // Broadcast notification to all affected users (old path doesn't exist in DB, pass users directly)
-                notificationService.broadcastFileEvent(
-                    FILE_EVENTS.FILE_RENAMED,
-                    {
-                        oldFilePath: effectiveFilePath,
-                        newFilePath: renamedFilePath,
-                        oldFileName: data.name || data.newName, // Original name before rename
-                        newFileName: finalFileName,
-                        fileType: renameFile.type,
-                        userId
-                    },
-                    affectedUsersRename
-                );
-                
-                return {
-                    success: true,
-                    operation: 'rename',
-                    message: 'File renamed successfully',
-                    oldPath: effectiveFilePath,
-                    newPath: renamedFilePath,
-                    newName: finalFileName,
-                    timestamp: new Date().toISOString()
-                };
-                
-            case 'getCollaborators':
-                // Get a list of users currently collaborating on this file
-                const collabFile = await File.findOneWithReadPermission(
-                    {filePath: effectiveFilePath},
-                    userId,
-                    userRoles
-                );
-                
-                if (!collabFile) {
-                    throw new Error('File not found or insufficient permissions');
-                }
-                
-                // Get active collaborators from the collaboration system
-                let activeCollaborators = [];
-                if (collabFile.type === 'text') {
-                    // If there's a collaboration tracking mechanism, use it
-                    // Use file path as document name for consistent identification
-                    const docId = yjsService.getDocumentName(collabFile.filePath);
-                    
-                    // Get from active sessions if available
-                    // Active collaborators now tracked by WebSocket server
-                    activeCollaborators = [];
-                }
-                
-                return {
-                    success: true,
-                    operation: 'getCollaborators',
-                    collaborators: activeCollaborators,
-                    filePath: effectiveFilePath,
-                    timestamp: new Date().toISOString()
-                };
-                
-            case 'getSharing':
-                // Get sharing information for this file
-                const sharingFile = await File.findOneWithReadPermission(
-                    {filePath: effectiveFilePath},
-                    userId,
-                    userRoles
-                );
-                
-                if (!sharingFile) {
-                    throw new Error('File not found or insufficient permissions');
-                }
-                
-                // Extract permissions and convert to sharing info
-                const permissionsMap = {
-                    read: sharingFile.permissions?.read || [],
-                    write: sharingFile.permissions?.write || [],
-                    admin: sharingFile.permissions?.admin || []
-                };
-                
-                // Add information about public sharing if available
-                const sharingInfo = {
-                    owner: sharingFile.owner,
-                    isOwner: sharingFile.owner.toString() === userId,
-                    permissions: permissionsMap,
-                    isPublic: sharingFile.isPublic || false,
-                    publicLink: sharingFile.publicLink || null,
-                    publicExpiresAt: sharingFile.publicExpiresAt || null
-                };
-                
-                return {
-                    success: true,
-                    operation: 'getSharing',
-                    sharing: sharingInfo,
-                    filePath: effectiveFilePath,
-                    timestamp: new Date().toISOString()
-                };
-                
-            default:
-                throw new Error(`Unsupported operation: ${operation}`);
-        }
-    } catch (error) {
-        // Ensure we have a filePath for logging, fallback to the original inputs if effectiveFilePath failed to be set
-        const logFilePath = effectiveFilePath || sourcePath || filePath || 'unknown';
-        logger.error('File operation error:', { operation, filePath: logFilePath, userId, error: error.message });
-        return { 
-            success: false, 
-            error: error.message || 'Operation failed',
-            filePath: logFilePath 
-        };
-    }
-};
-
-export {fileController, executeFileOperation, yjsService, normalizeFilePath};
+export {fileController, yjsService, normalizeFilePath};
 export default fileController;
