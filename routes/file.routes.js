@@ -28,7 +28,6 @@ router.validRoutes = [
     '/api/v1/files/copy',                     // Copy operations
     '/api/v1/files/:filePath/content',        // File content retrieval and save
     '/api/v1/files/:filePath/metadata',       // File metadata retrieval
-    '/api/v1/files/:filePath/open',           // File-open bootstrap payload
     '/api/v1/files/:filePath/versions',       // Version listing and creation
     '/api/v1/files/:filePath/versions/:versionNumber', // Version load/delete
     '/api/v1/files/:filePath/rename',         // Rename files or directories
@@ -288,11 +287,6 @@ router.post('/copy',
 router.get('/:filePath/metadata',
     validateRequest(fileParamSchemas.filePath, 'params'),
     fileController.getFileMetadata
-);
-
-router.get('/:filePath/open',
-    validateRequest(fileParamSchemas.filePath, 'params'),
-    fileController.getFileOpenBootstrap
 );
 
 router.get('/:filePath/content',

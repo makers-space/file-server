@@ -1028,67 +1028,6 @@ const fileController = {
     }),
 
     /**
-     * @desc    Get file-open bootstrap payload (metadata + optional initial content)
-     * @route   GET /api/v1/files/:filePath/open
-     * @access  Private (requires read permission)
-     */
-    getFileOpenBootstrap: asyncHandler(async (req, res) => {
-        const {filePath} = req.params;
-        const decodedFilePath = decodeFilePath(filePath);
-        const userId = getUserId(req);
-        const userRoles = req.user?.roles || [];
-
-        const metaFile = await File.findOneWithReadPermission(
-            {filePath: decodedFilePath},
-            userId,
-            userRoles
-        );
-        if (!metaFile) {
-            throw new AppError('File not found or access denied', 404);
-        }
-
-        const versionStorageSize = metaFile.versionHistory.reduce((sum, v) => sum + (v.size || 0), 0);
-        const size = metaFile.size + versionStorageSize;
-        const metadataResult = {
-            success: true,
-            operation: 'getMetadata',
-            _id: metaFile._id,
-            filePath: metaFile.filePath,
-            fileName: metaFile.fileName,
-            type: metaFile.type,
-            mimeType: metaFile.mimeType,
-            size,
-            owner: metaFile.owner,
-            tags: metaFile.tags,
-            description: metaFile.description,
-            permissions: metaFile.permissions,
-            version: metaFile.version,
-            versionHistory: metaFile.versionHistory,
-            createdAt: metaFile.createdAt,
-            updatedAt: metaFile.updatedAt,
-            lastModifiedBy: metaFile.lastModifiedBy,
-            mediaMetadata: metaFile.mediaMetadata || null,
-            timestamp: new Date().toISOString()
-        };
-
-        let initialContent = null;
-        if (metadataResult.type === 'text') {
-            initialContent = (await getAndDecompress(metaFile)) || '';
-        }
-
-        res.status(200).json({
-            success: true,
-            operation: 'open',
-            kind: metadataResult.type === 'directory' ? 'directory' : 'file',
-            filePath: decodedFilePath,
-            metadata: metadataResult,
-            initialContent,
-            collaborationRoom: metadataResult.type === 'text' ? `yjs${decodedFilePath}` : null,
-            timestamp: new Date().toISOString()
-        });
-    }),
-
-    /**
      * @desc    Get file content
      * @route   GET /api/v1/files/:filePath/content
      * @access  Private (requires read permission)
