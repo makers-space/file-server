@@ -2316,7 +2316,7 @@ const fileController = {
                 ]
             });
 
-            // Root path is always accessible for any authenticated user (new users start with no files)
+            // Root path: allow any authenticated user (virtual root — no DB record)
             const isRootPath = !dirPath || dirPath === '/';
             if (!directory && !isRootPath) {
                 return res.status(404).json({
@@ -2396,31 +2396,47 @@ const fileController = {
             }
 
             const dirPath = req.query.filePath;
+            const isRootPath = !dirPath || dirPath === '/';
+            const userRolesForStats = req.user?.roles || [];
+            const hasAdminContentAccess = hasRight(userRolesForStats, RIGHTS.MANAGE_ALL_CONTENT);
 
-            // Check if directory exists
-            const directory = await File.findOne({
-                filePath: dirPath || '/',
+            // Root path is only accessible to admin/owner — regular users must query their own subtree
+            if (isRootPath && !hasAdminContentAccess) {
+                return res.status(403).json({
+                    success: false,
+                    message: 'Access denied: use your own directory path'
+                });
+            }
+
+            // Check if directory exists (skip for root — no DB record for '/')
+            const directory = isRootPath ? null : await File.findOne({
+                filePath: dirPath,
                 owner: userId,
                 type: 'directory'
             });
 
-            if (!directory) {
+            if (!isRootPath && !directory) {
                 return res.status(404).json({
                     success: false,
                     message: 'Directory not found'
                 });
             }
 
-            // Use optimized aggregation pipeline for efficient statistics
+            // Admin/owner querying root gets system-wide stats (no owner filter)
+            // Everyone else is scoped to their own files under the requested path
+            const statsMatch = isRootPath
+                ? {} // all files in the system
+                : {
+                    owner: new mongoose.Types.ObjectId(userId),
+                    $or: [
+                        { filePath: dirPath },
+                        { filePath: new RegExp(`^${dirPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/`) }
+                    ]
+                  };
+
             const stats = await File.aggregate([
                 {
-                    $match: {
-                        owner: new mongoose.Types.ObjectId(userId),
-                        $or: [
-                            { filePath: dirPath },
-                            { filePath: new RegExp(`^${dirPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/`) }
-                        ]
-                    }
+                    $match: statsMatch
                 },
                 {
                     // Compute total storage per document: working size + all saved version sizes
@@ -2524,11 +2540,11 @@ const fileController = {
                     text: typeData.text?.count || 0,
                     binary: typeData.binary?.count || 0
                 },
-                directory: {
+                directory: directory ? {
                     filePath: directory.filePath,
                     createdAt: directory.createdAt,
                     updatedAt: directory.updatedAt
-                },
+                } : { filePath: isRootPath ? '/' : dirPath },
                 meta: {
                     timestamps: {
                         newestFile: timeData.newestFile,
@@ -3911,27 +3927,23 @@ const fileController = {
 
         // If groupId is provided, verify the user is a member of that group
         // and that the file is shared in that group
+        // Check file access: user must own the file, have read/write permission, or be an admin
+        const isOwner = file.owner.equals(userId);
+        const hasRead = file.permissions?.read?.some(id => id.equals(userId));
+        const hasWrite = file.permissions?.write?.some(id => id.equals(userId));
+        const isAdmin = hasRight(req.user.roles, RIGHTS.MANAGE_ALL_CONTENT);
+
+        if (!isOwner && !hasRead && !hasWrite && !isAdmin) {
+            return next(new AppError('You do not have access to comment on this file', 403));
+        }
+
         if (groupId) {
-            const group = await Group.findById(groupId).select('members files');
+            const group = await Group.findById(groupId).select('members');
             if (!group) {
                 return next(new AppError('Group not found', 404));
             }
             if (!group.isMember(userId)) {
                 return next(new AppError('You must be a group member to comment', 403));
-            }
-            const fileInGroup = group.files.some(f => f.file.equals(fileId));
-            if (!fileInGroup) {
-                return next(new AppError('This file is not shared in this group', 400));
-            }
-        } else {
-            // Direct file comment: user must be owner or have read permission
-            const isOwner = file.owner.equals(userId);
-            const hasRead = file.permissions?.read?.some(id => id.equals(userId));
-            const hasWrite = file.permissions?.write?.some(id => id.equals(userId));
-            const isAdmin = hasRight(req.user.roles, RIGHTS.MANAGE_ALL_CONTENT);
-
-            if (!isOwner && !hasRead && !hasWrite && !isAdmin) {
-                return next(new AppError('You do not have access to comment on this file', 403));
             }
         }
 
