@@ -509,15 +509,9 @@ class PersistenceCoordinator {
 
     /**
      * Called by setPersistence.bindState — loads MongoDB state into ydoc and
-     * installs the update listener that schedules batched writes.  Waits for
-     * any in-flight writeState so the load sees the freshest snapshot.
+     * installs the update listener that schedules batched writes.
      */
     async bindState(docName, ydoc) {
-        const state = this._state(docName);
-        if (state.writePromise) {
-            try { await state.writePromise; } catch { /* logged elsewhere */ }
-        }
-
         try {
             const persistedYdoc = await this.persistence.getYDoc(docName);
             const persistedUpdate = Y.encodeStateAsUpdate(persistedYdoc);
@@ -630,41 +624,30 @@ class PersistenceCoordinator {
             state.flushTimer = null;
         }
 
-        if (state.writePromise) {
-            try { await state.writePromise; } catch { /* logged */ }
-        }
-
         if (liveDoc) {
+            const ytext = liveDoc.getText('content');
             liveDoc.transact(() => {
-                const ytext = liveDoc.getText('content');
                 ytext.delete(0, ytext.length);
                 if (content) ytext.insert(0, content);
             });
             return;
         }
 
-        const work = (async () => {
-            try {
-                await this.persistence.clearDocument(docName);
-                if (content) {
-                    const ydoc = new Y.Doc();
-                    ydoc.getText('content').insert(0, content);
-                    await this.persistence.storeUpdate(docName, Y.encodeStateAsUpdate(ydoc));
-                    ydoc.destroy();
-                }
-                try { await this.touchFileMetadata(docName); } catch (e) {
-                    logger.error('replaceContent touchFileMetadata failed', { docName, error: e.message });
-                }
-            } catch (error) {
-                logger.error('PersistenceCoordinator replaceContent failed', { docName, error: error.message });
-                throw error;
-            }
-        })();
-        state.writePromise = work;
         try {
-            await work;
-        } finally {
-            if (state.writePromise === work) state.writePromise = null;
+            await this.persistence.clearDocument(docName);
+            if (content) {
+                const ydoc = new Y.Doc();
+                ydoc.getText('content').insert(0, content);
+                const update = Y.encodeStateAsUpdate(ydoc);
+                await this.persistence.storeUpdate(docName, update);
+                ydoc.destroy();
+            }
+            try { await this.touchFileMetadata(docName); } catch (e) {
+                logger.error('replaceContent touchFileMetadata failed', { docName, error: e.message });
+            }
+        } catch (error) {
+            logger.error('PersistenceCoordinator replaceContent failed', { docName, error: error.message });
+            throw error;
         }
     }
 
