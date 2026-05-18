@@ -529,10 +529,28 @@ class Server {
                                     let docContentTextLen = 0;
                                     try {
                                         if (liveDocAfter) {
-                                            docStateLen = (await import('yjs')).encodeStateAsUpdate(liveDocAfter).length;
+                                            const Y = await import('yjs');
+                                            const syncProto = await import('y-protocols/sync');
+                                            const encodingMod = await import('lib0/encoding');
+                                            const fullUpdate = Y.encodeStateAsUpdate(liveDocAfter);
+                                            docStateLen = fullUpdate.length;
                                             docContentTextLen = liveDocAfter.getText('content').toString().length;
+                                            // Proactively push full state as sync-step-2 to this new conn,
+                                            // mirroring what bindState's update broadcast does for the FIRST
+                                            // conn. Without this, 2nd+ conns can be left blank because the
+                                            // client's syncStep1 → readSyncMessage handshake is not reliably
+                                            // producing a non-empty reply in production.
+                                            if (docStateLen > 2 && ws.readyState === ws.constructor.OPEN) {
+                                                const encoder = encodingMod.createEncoder();
+                                                encodingMod.writeVarUint(encoder, 0); // messageSync
+                                                syncProto.writeUpdate(encoder, fullUpdate);
+                                                const payload = encodingMod.toUint8Array(encoder);
+                                                ws.send(payload);
+                                            }
                                         }
-                                    } catch {}
+                                    } catch (err) {
+                                        logger.warn('[Yjs] proactive state push failed', { docName, error: err.message });
+                                    }
                                     logger.info('[Yjs] WS CONNECT', { connId: __connId, userId: user.id, docName, connsBefore, connsAfter, docStateLen, docContentTextLen });
                                     ws.on('close', (code, reason) => {
                                         const ld = docs.get(docName);
