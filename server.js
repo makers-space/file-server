@@ -484,86 +484,30 @@ class Server {
                                         ws.close(4403, 'Access denied');
                                         return;
                                     }
-                                    const liveDoc = docs.get(docName);
-                                    const connsBefore = liveDoc ? liveDoc.conns.size : 0;
-                                    // --- TEMP DIAGNOSTIC: wrap ws.send + raw message listener to trace per-conn frames
-                                    const __connId = Math.random().toString(36).slice(2, 8);
-                                    const __origSend = ws.send.bind(ws);
-                                    ws.send = (data, ...rest) => {
-                                        try {
-                                            const len = data?.byteLength ?? data?.length ?? 0;
-                                            let kind = 'other';
-                                            if (data instanceof Uint8Array && data.length > 0) {
-                                                // message type is first varuint byte (0=sync, 1=awareness)
-                                                const t = data[0];
-                                                if (t === 0 && data.length > 1) {
-                                                    // sync subtype is next varuint byte
-                                                    kind = `sync-step-${data[1]}`;
-                                                } else if (t === 1) {
-                                                    kind = 'awareness';
-                                                } else {
-                                                    kind = `type-${t}`;
-                                                }
-                                            }
-                                            logger.info('[Yjs] WS SEND', { connId: __connId, docName, len, kind });
-                                        } catch {}
-                                        return __origSend(data, ...rest);
-                                    };
-                                    ws.on('message', (data) => {
-                                        try {
-                                            const buf = data instanceof Buffer ? data : Buffer.from(data);
-                                            let kind = 'other';
-                                            if (buf.length > 0) {
-                                                const t = buf[0];
-                                                if (t === 0 && buf.length > 1) kind = `sync-step-${buf[1]}`;
-                                                else if (t === 1) kind = 'awareness';
-                                                else kind = `type-${t}`;
-                                            }
-                                            logger.info('[Yjs] WS RECV', { connId: __connId, docName, len: buf.length, kind });
-                                        } catch {}
-                                    });
                                     setupWSConnection(ws, req, { docName, gc: false });
-                                    const liveDocAfter = docs.get(docName);
-                                    const connsAfter = liveDocAfter ? liveDocAfter.conns.size : 0;
-                                    let docStateLen = 0;
-                                    let docContentTextLen = 0;
+                                    // Proactively push full doc state as messageYjsUpdate to this new conn.
+                                    // bindState's update broadcast only reaches the FIRST conn that triggers
+                                    // the load; subsequent conns can be left blank because the client/server
+                                    // syncStep1 handshake doesn't reliably produce a non-empty reply in
+                                    // production. This guarantees every new conn receives the current state.
                                     try {
-                                        if (liveDocAfter) {
+                                        const liveDoc = docs.get(docName);
+                                        if (liveDoc) {
                                             const Y = await import('yjs');
                                             const syncProto = await import('y-protocols/sync');
                                             const encodingMod = await import('lib0/encoding');
-                                            const fullUpdate = Y.encodeStateAsUpdate(liveDocAfter);
-                                            docStateLen = fullUpdate.length;
-                                            docContentTextLen = liveDocAfter.getText('content').toString().length;
-                                            // Proactively push full state as sync-step-2 to this new conn,
-                                            // mirroring what bindState's update broadcast does for the FIRST
-                                            // conn. Without this, 2nd+ conns can be left blank because the
-                                            // client's syncStep1 → readSyncMessage handshake is not reliably
-                                            // producing a non-empty reply in production.
-                                            if (docStateLen > 2 && ws.readyState === ws.constructor.OPEN) {
+                                            const fullUpdate = Y.encodeStateAsUpdate(liveDoc);
+                                            if (fullUpdate.length > 2 && ws.readyState === ws.constructor.OPEN) {
                                                 const encoder = encodingMod.createEncoder();
                                                 encodingMod.writeVarUint(encoder, 0); // messageSync
                                                 syncProto.writeUpdate(encoder, fullUpdate);
-                                                const payload = encodingMod.toUint8Array(encoder);
-                                                ws.send(payload);
+                                                ws.send(encodingMod.toUint8Array(encoder));
                                             }
                                         }
                                     } catch (err) {
                                         logger.warn('[Yjs] proactive state push failed', { docName, error: err.message });
                                     }
-                                    logger.info('[Yjs] WS CONNECT', { connId: __connId, userId: user.id, docName, connsBefore, connsAfter, docStateLen, docContentTextLen });
-                                    ws.on('close', (code, reason) => {
-                                        const ld = docs.get(docName);
-                                        const remaining = ld ? ld.conns.size : 0;
-                                        logger.info('[Yjs] WS CLOSE', {
-                                            connId: __connId,
-                                            userId: user.id,
-                                            docName,
-                                            code,
-                                            reason: reason?.toString?.() || '',
-                                            remaining,
-                                        });
-                                    });
+                                    logger.debug('Yjs WebSocket connection established', { userId: user.id, docName });
                                 },
                             },
                         ];
@@ -579,17 +523,8 @@ class Server {
                                 }
                                 await route.handle(ws, req);
                             } catch (error) {
-                                // Auth failures are common (expired tokens from stale tabs).
-                                // Log at debug to avoid flooding production logs, and close
-                                // with 4401 so well-behaved clients can stop retrying.
-                                const isAuthError = /token|auth/i.test(error?.message || '');
-                                if (isAuthError) {
-                                    logger.debug('WebSocket auth rejected', { url: req.url, message: error.message });
-                                    try { ws.close(4401, 'Authentication failed'); } catch { /* already closed */ }
-                                } else {
-                                    logger.error('WebSocket connection error:', error);
-                                    try { ws.close(1008, 'Connection error'); } catch { /* already closed */ }
-                                }
+                                logger.error('WebSocket connection error:', error);
+                                try { ws.close(1008, 'Authentication failed'); } catch { /* already closed */ }
                             }
                         });
                         
