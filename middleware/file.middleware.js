@@ -480,10 +480,6 @@ const makeDocState = () => ({
     flushTimer: null,
     writePromise: null,        // in-flight writeState (or replaceContent) flush
     dirty: false,              // anything happened since last metadata touch?
-    bindLoaded: false,         // true once bindState successfully loaded persisted state
-                               // into the live ydoc.  Guards writeState against wiping
-                               // Mongo when the WS disconnects mid-load (the classic
-                               // "open 2nd window, content disappears" race).
 });
 
 class PersistenceCoordinator {
@@ -518,10 +514,6 @@ class PersistenceCoordinator {
      */
     async bindState(docName, ydoc) {
         const state = this._state(docName);
-        // A fresh bindState always re-loads — clear the prior load flag so a
-        // racing writeState before this load completes can't wipe Mongo.
-        state.bindLoaded = false;
-        logger.info('[Yjs] bindState start', { docName });
         if (state.writePromise) {
             try { await state.writePromise; } catch { /* logged elsewhere */ }
         }
@@ -529,21 +521,12 @@ class PersistenceCoordinator {
         try {
             const persistedYdoc = await this.persistence.getYDoc(docName);
             const persistedUpdate = Y.encodeStateAsUpdate(persistedYdoc);
-            const loadedText = persistedYdoc.getText('content').toString();
             if (persistedUpdate.length > 0) {
                 Y.applyUpdate(ydoc, persistedUpdate);
             }
             persistedYdoc.destroy();
-            // Only mark loaded on success — a thrown error leaves the live ydoc
-            // empty and we MUST NOT let a subsequent writeState clear Mongo.
-            state.bindLoaded = true;
-            logger.info('[Yjs] bindState loaded', {
-                docName,
-                updateBytes: persistedUpdate.length,
-                textLen: loadedText.length,
-            });
         } catch (error) {
-            logger.error('[Yjs] bindState load failed — bindLoaded stays false', { docName, error: error.message });
+            logger.error('PersistenceCoordinator.bindState load failed', { docName, error: error.message });
         }
 
         ydoc.on('update', (update) => this._enqueueUpdate(docName, ydoc, update));
@@ -609,42 +592,12 @@ class PersistenceCoordinator {
             }
             state.pendingUpdates = [];
 
-            // CRITICAL #1: if bindState never finished loading persisted state
-            // into this ydoc, do not touch Mongo.  Otherwise a transient
-            // disconnect mid-load (StrictMode unmount, brief network blip, 2nd
-            // window race, failed Mongo read) triggers conns.size === 0 →
-            // writeState → we would clearDocument on an EMPTY ydoc and
-            // permanently wipe the file.
-            if (!state.bindLoaded) {
-                logger.warn('[Yjs] writeState SKIPPED: bindState did not complete (preserving Mongo state)', { docName });
-                return;
-            }
-
             try {
                 const fullState = Y.encodeStateAsUpdate(ydoc);
-                const liveText = ydoc.getText('content').toString();
-
-                // CRITICAL #2: never clearDocument when the in-memory ydoc is
-                // empty.  If we did, an empty ydoc (from any cause: failed
-                // sync, GC race, multi-instance split-brain stale copy, an
-                // unexpected Yjs edge case) would wipe persisted content.
-                // Lengths <= 2 are the Yjs "empty doc" encoding.
-                if (fullState.length <= 2 || liveText.length === 0) {
-                    logger.warn('[Yjs] writeState SKIPPED: live ydoc is empty, refusing to clear Mongo', {
-                        docName,
-                        fullStateBytes: fullState.length,
-                        liveTextLen: liveText.length,
-                    });
-                    return;
-                }
-
-                logger.info('[Yjs] writeState flushing', {
-                    docName,
-                    fullStateBytes: fullState.length,
-                    liveTextLen: liveText.length,
-                });
                 await this.persistence.clearDocument(docName);
-                await this.persistence.storeUpdate(docName, fullState);
+                if (fullState.length > 2) {
+                    await this.persistence.storeUpdate(docName, fullState);
+                }
                 if (state.dirty) {
                     state.dirty = false;
                     try { await this.touchFileMetadata(docName); } catch (e) {
