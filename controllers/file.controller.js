@@ -1017,6 +1017,7 @@ const fileController = {
             tags: metaFile.tags,
             description: metaFile.description,
             permissions: metaFile.permissions,
+            canWrite: metaFile.hasWriteAccess(userId, userRoles),
             version: metaFile.version,
             versionHistory: metaFile.versionHistory,
             createdAt: metaFile.createdAt,

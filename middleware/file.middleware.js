@@ -401,6 +401,290 @@ const handleFileErrors = (err, req, res, next) => {
 };
 
 // =============================================================================
+// YJS DOCUMENT NAME / PATH TRANSLATION
+// =============================================================================
+
+/**
+ * Canonical filePath <-> Yjs document name translation.
+ *
+ * Wire format on every layer must agree:
+ *   filePath:  "/user/foo bar.md"       (absolute, unix slashes, may contain spaces / unicode)
+ *   docName:   "yjs/user/foo bar.md"    (no leading slash, "yjs/" prefix; raw — no URL encoding)
+ *   wsUrl:     "${WS_BASE}/yjs/user/foo bar.md" (the browser will percent-encode in transit)
+ *
+ * The server URL-decodes req.url before calling docNameFromUrlPath; the
+ * client must NOT pre-encode the room name passed to WebsocketProvider —
+ * y-websocket builds the URL itself and the browser handles encoding.
+ */
+
+const YJS_PREFIX = 'yjs';
+
+/** Normalize a filesystem path: backslashes -> slashes, collapse duplicates,
+ *  ensure absolute, strip trailing slash (except root). */
+const normalizeFilePath = (filePath) => {
+    if (!filePath) return '/';
+    let p = String(filePath).replace(/\\/g, '/').replace(/\/+/g, '/');
+    if (!p.startsWith('/')) p = '/' + p;
+    if (p !== '/' && p.endsWith('/')) p = p.slice(0, -1);
+    return p;
+};
+
+/** filePath -> docName.  Idempotent: if input already looks like a docName
+ *  (starts with "yjs/" or "/yjs/"), it is recognized and not double-prefixed. */
+const docNameFromFilePath = (filePath) => {
+    const normalized = normalizeFilePath(filePath);
+    if (normalized === '/') return YJS_PREFIX;
+    if (normalized.startsWith(`/${YJS_PREFIX}/`)) return normalized.slice(1);
+    return YJS_PREFIX + normalized;
+};
+
+/** docName -> filePath.  Inverse of docNameFromFilePath. */
+const filePathFromDocName = (docName) => {
+    if (!docName) return '/';
+    if (docName === YJS_PREFIX) return '/';
+    if (docName.startsWith(`${YJS_PREFIX}/`)) return '/' + docName.slice(YJS_PREFIX.length + 1);
+    return '/' + docName.replace(/^\/+/, '');
+};
+
+/** Extract the docName from a WebSocket request URL (e.g. "/yjs/user/foo%20bar.md?token=..").
+ *  Strips query string and percent-decodes so it matches docNameFromFilePath output. */
+const docNameFromUrlPath = (reqUrl) => {
+    const pathAndQuery = String(reqUrl || '');
+    const pathOnly = pathAndQuery.split('?')[0];
+    const raw = pathOnly.startsWith('/') ? pathOnly.slice(1) : pathOnly;
+    try {
+        return decodeURIComponent(raw);
+    } catch {
+        return raw;
+    }
+};
+
+// =============================================================================
+// YJS PERSISTENCE COORDINATOR
+// =============================================================================
+
+/**
+ * Centralizes per-doc epoch (stale-batch invalidation), batched writes
+ * (single timer per doc covering both Yjs snapshot AND file `updatedAt`),
+ * and writeState gating so a reconnecting bindState always sees the
+ * freshest MongoDB state.  Replaces the previous ad-hoc writeStatePromises
+ * Map, cancelFn registry, dual 500ms/3000ms debouncers, and inline
+ * compaction race.
+ */
+const YJS_FLUSH_DELAY_MS = parseInt(process.env.YJS_FLUSH_DELAY_MS, 10) || 500;
+
+const makeDocState = () => ({
+    epoch: 0,                  // bumped on replaceContent — old batches are discarded
+    pendingUpdates: [],        // accumulated Yjs updates awaiting flush
+    pendingEpoch: 0,           // epoch under which pendingUpdates were captured
+    flushTimer: null,
+    writePromise: null,        // in-flight writeState (or replaceContent) flush
+    dirty: false,              // anything happened since last metadata touch?
+});
+
+class PersistenceCoordinator {
+    /**
+     * @param {object} opts
+     * @param {object} opts.persistence  - y-mongodb-provider MongodbPersistence instance
+     * @param {function} opts.touchFileMetadata - async (docName) => void
+     * @param {function} [opts.onDocFlushed] - optional hook (docName, epoch) => void
+     */
+    constructor({ persistence, touchFileMetadata, onDocFlushed }) {
+        if (!persistence) throw new Error('PersistenceCoordinator requires persistence');
+        if (!touchFileMetadata) throw new Error('PersistenceCoordinator requires touchFileMetadata');
+        this.persistence = persistence;
+        this.touchFileMetadata = touchFileMetadata;
+        this.onDocFlushed = onDocFlushed || (() => {});
+        this.docs = new Map();
+    }
+
+    _state(docName) {
+        let s = this.docs.get(docName);
+        if (!s) {
+            s = makeDocState();
+            this.docs.set(docName, s);
+        }
+        return s;
+    }
+
+    /**
+     * Called by setPersistence.bindState — loads MongoDB state into ydoc and
+     * installs the update listener that schedules batched writes.  Waits for
+     * any in-flight writeState so the load sees the freshest snapshot.
+     */
+    async bindState(docName, ydoc) {
+        const state = this._state(docName);
+        if (state.writePromise) {
+            try { await state.writePromise; } catch { /* logged elsewhere */ }
+        }
+
+        try {
+            const persistedYdoc = await this.persistence.getYDoc(docName);
+            const persistedUpdate = Y.encodeStateAsUpdate(persistedYdoc);
+            if (persistedUpdate.length > 0) {
+                Y.applyUpdate(ydoc, persistedUpdate);
+            }
+            persistedYdoc.destroy();
+        } catch (error) {
+            logger.error('PersistenceCoordinator.bindState load failed', { docName, error: error.message });
+        }
+
+        ydoc.on('update', (update) => this._enqueueUpdate(docName, ydoc, update));
+    }
+
+    _enqueueUpdate(docName, ydoc, update) {
+        const state = this._state(docName);
+        if (state.pendingUpdates.length === 0) {
+            state.pendingEpoch = state.epoch;
+        }
+        state.pendingUpdates.push(update);
+        state.dirty = true;
+        if (state.flushTimer) return;
+        state.flushTimer = setTimeout(() => this._flush(docName, ydoc).catch((err) => {
+            logger.error('PersistenceCoordinator flush error', { docName, error: err.message });
+        }), YJS_FLUSH_DELAY_MS);
+    }
+
+    async _flush(docName, ydoc) {
+        const state = this._state(docName);
+        state.flushTimer = null;
+        const batchEpoch = state.pendingEpoch;
+        const updates = state.pendingUpdates;
+        state.pendingUpdates = [];
+
+        // Stale batch from a pre-replaceContent epoch — discard.
+        if (batchEpoch !== state.epoch || updates.length === 0) {
+            return;
+        }
+
+        try {
+            const compacted = updates.length === 1
+                ? updates[0]
+                : Y.mergeUpdates(updates);
+            await this.persistence.storeUpdate(docName, compacted);
+        } catch (error) {
+            logger.error('PersistenceCoordinator storeUpdate failed', { docName, error: error.message });
+        }
+
+        if (state.dirty) {
+            state.dirty = false;
+            try {
+                await this.touchFileMetadata(docName);
+            } catch (error) {
+                logger.error('PersistenceCoordinator touchFileMetadata failed', { docName, error: error.message });
+            }
+        }
+
+        this.onDocFlushed(docName, batchEpoch);
+    }
+
+    /**
+     * Called by setPersistence.writeState — runs when the last client
+     * disconnects.  Serialized per-doc via state.writePromise so concurrent
+     * bindState calls wait for the snapshot to commit before reading.
+     */
+    async writeState(docName, ydoc) {
+        const state = this._state(docName);
+        const work = (async () => {
+            if (state.flushTimer) {
+                clearTimeout(state.flushTimer);
+                state.flushTimer = null;
+            }
+            state.pendingUpdates = [];
+
+            try {
+                const fullState = Y.encodeStateAsUpdate(ydoc);
+                await this.persistence.clearDocument(docName);
+                if (fullState.length > 2) {
+                    await this.persistence.storeUpdate(docName, fullState);
+                }
+                if (state.dirty) {
+                    state.dirty = false;
+                    try { await this.touchFileMetadata(docName); } catch (e) {
+                        logger.error('writeState touchFileMetadata failed', { docName, error: e.message });
+                    }
+                }
+            } catch (error) {
+                logger.error('PersistenceCoordinator writeState failed', { docName, error: error.message });
+            }
+        })();
+        state.writePromise = work;
+        try {
+            await work;
+        } finally {
+            if (state.writePromise === work) state.writePromise = null;
+        }
+    }
+
+    /**
+     * Atomically replace the content of a Yjs document.  Used by file
+     * create / overwrite / delete operations.  Epoch is bumped FIRST so any
+     * in-flight batched write of pre-replace updates is dropped on flush.
+     */
+    async replaceContent(docName, content, { liveDoc } = {}) {
+        const state = this._state(docName);
+        state.epoch += 1;
+        state.pendingUpdates = [];
+        if (state.flushTimer) {
+            clearTimeout(state.flushTimer);
+            state.flushTimer = null;
+        }
+
+        if (state.writePromise) {
+            try { await state.writePromise; } catch { /* logged */ }
+        }
+
+        if (liveDoc) {
+            liveDoc.transact(() => {
+                const ytext = liveDoc.getText('content');
+                ytext.delete(0, ytext.length);
+                if (content) ytext.insert(0, content);
+            });
+            return;
+        }
+
+        const work = (async () => {
+            try {
+                await this.persistence.clearDocument(docName);
+                if (content) {
+                    const ydoc = new Y.Doc();
+                    ydoc.getText('content').insert(0, content);
+                    await this.persistence.storeUpdate(docName, Y.encodeStateAsUpdate(ydoc));
+                    ydoc.destroy();
+                }
+                try { await this.touchFileMetadata(docName); } catch (e) {
+                    logger.error('replaceContent touchFileMetadata failed', { docName, error: e.message });
+                }
+            } catch (error) {
+                logger.error('PersistenceCoordinator replaceContent failed', { docName, error: error.message });
+                throw error;
+            }
+        })();
+        state.writePromise = work;
+        try {
+            await work;
+        } finally {
+            if (state.writePromise === work) state.writePromise = null;
+        }
+    }
+
+    /** Flush all pending writes and clear all per-doc state.  Call on shutdown. */
+    async shutdown() {
+        const promises = [];
+        for (const [, state] of this.docs) {
+            if (state.flushTimer) {
+                clearTimeout(state.flushTimer);
+                state.flushTimer = null;
+            }
+            if (state.writePromise) promises.push(state.writePromise.catch(() => {}));
+            state.pendingUpdates = [];
+        }
+        await Promise.all(promises);
+        this.docs.clear();
+    }
+}
+
+// =============================================================================
 // YJS REDIS ADAPTER FOR HORIZONTAL SCALING
 // =============================================================================
 
@@ -652,7 +936,7 @@ class YjsService {
         this.isInitialized = false;
         this.documents = new Map(); // Cache for persistent Yjs documents
         this.wsDocsMap = null; // Reference to @y/websocket-server's in-memory docs Map
-        this.cancelFns = new Map(); // docName -> fn() that cancels pending persistence timeout
+        this.coordinator = null; // PersistenceCoordinator (wired from server.js)
         
         this.config = {
             collectionName: process.env.YJS_COLLECTION_NAME,
@@ -782,27 +1066,11 @@ class YjsService {
     }
 
     /**
-     * Get document name from file path (simple hash for Yjs document identification)
-     * Must match client-side implementation AND WebSocket server naming convention
+     * Get the Yjs document name for a file path.
+     * Delegates to the canonical helper so client + server + WS URL stay aligned.
      */
     getDocumentName(filePath) {
-        // Normalize the path
-        let normalizedPath = filePath.replace(/\\/g, '/').replace(/\/+/g, '/');
-        
-        // Ensure path starts with /
-        if (!normalizedPath.startsWith('/')) {
-            normalizedPath = '/' + normalizedPath;
-        }
-        
-        // WebSocket server uses the URL path but strips the leading slash
-        // So for URL path "/yjs/base/file", the WebSocket document name is "yjs/base/file"
-        if (normalizedPath.startsWith('/yjs/')) {
-            // Already has the WebSocket prefix, remove leading slash to match WebSocket server
-            return normalizedPath.slice(1);
-        } else {
-            // Add the WebSocket prefix and remove leading slash to match WebSocket server
-            return 'yjs' + normalizedPath;
-        }
+        return docNameFromFilePath(filePath);
     }
 
 
@@ -952,230 +1220,69 @@ class YjsService {
      * Initialize or replace a Yjs document with new content.
      * Used for file creation (new upload) and file overwrite (re-upload).
      *
-     * Two paths depending on whether clients are currently connected:
-     *
-     * PATH A — live clients exist:
-     *   Apply the new content as a Yjs transaction directly on the in-memory
-     *   WSSharedDoc. The @y/websocket-server sync protocol broadcasts the delta
-     *   to every connected client immediately, and the existing `update` listener
-     *   (registered in bindState) persists it to MongoDB.  No eviction, no
-     *   auto-reconnect race, no CRDT merge with stale client state.
-     *
-     * PATH B — no live clients:
-     *   Safe to replace MongoDB records directly. Clear the old content, write
-     *   the new content, then clear local caches. When the next client connects
-     *   bindState loads the fresh MongoDB state into a new empty Y.Doc — clean.
-     *
-     * The old "evict then reconnect" approach had an unavoidable race: y-websocket
-     * auto-reconnects synchronously the moment the WS connection closes, so the
-     * client sent its stale state before bindState finished loading the new
-     * MongoDB content, and the CRDT merged them together.
+     * Delegates to PersistenceCoordinator.replaceContent which:
+     *   - Bumps the per-doc epoch so any in-flight batched write of pre-replace
+     *     updates is discarded when its flush timer fires (no manual cancelFn).
+     *   - If a live wsDoc exists, applies the change as a transaction so
+     *     connected clients receive the delta via the sync protocol — no
+     *     eviction, no auto-reconnect race with stale client state.
+     *   - Otherwise clears MongoDB and writes the new content directly.
      */
     async initializeTextContent(filePath, initialContent) {
-        try {
-            const docName = this.getDocumentName(filePath);
+        const docName = this.getDocumentName(filePath);
 
-            // Always cancel any pending batched persistence writes first so the
-            // 500 ms timer cannot write stale updates after we replace the content.
-            this.cancelPendingUpdates(docName);
-
-            // ── PATH A: live WS clients exist ────────────────────────────────────
-            // If the @y/websocket-server currently holds this doc in memory it means
-            // at least one client is (or was recently) connected. Apply the change
-            // as a transaction on that live doc so clients receive it via sync.
-            if (this.wsDocsMap) {
-                const wsDoc = this.wsDocsMap.get(docName);
-                if (wsDoc) {
-                    wsDoc.transact(() => {
-                        const ytext = wsDoc.getText('content');
-                        ytext.delete(0, ytext.length);
-                        if (initialContent) ytext.insert(0, initialContent);
-                    });
-                    // The update listener registered by bindState will persist this
-                    // transaction to MongoDB within 500 ms. No direct MongoDB write
-                    // needed — and no eviction, so no reconnect race.
-
-                    // Drop our own local cache entry (it's stale relative to wsDoc).
-                    const cachedDoc = this.documents.get(docName);
-                    if (cachedDoc && cachedDoc !== wsDoc) {
-                        cachedDoc.destroy();
-                        this.documents.delete(docName);
-                    }
-
-                    logger.info('Yjs document content replaced via live transaction', {
-                        filePath,
-                        docName,
-                        contentLength: initialContent?.length || 0
-                    });
-                    return;
-                }
-            }
-
-            // ── PATH B: no live WS clients — safe MongoDB replacement ─────────────
-
-            // 1a. Destroy local cached doc (prevents stale reads from our cache)
-            const cachedDoc = this.documents.get(docName);
-            if (cachedDoc) {
-                cachedDoc.destroy();
-                this.documents.delete(docName);
-            }
-
-            // 1b. Unbind from Redis adapter if active (for horizontal scaling)
-            if (this.redisAdapter) {
-                try {
-                    await this.redisAdapter.removeAdapter(docName);
-                } catch (redisErr) {
-                    logger.debug('Redis adapter cleanup (non-fatal):', { docName, error: redisErr.message });
-                }
-            }
-
-            // 2a. Delete all Yjs updates from MongoDB using direct Mongoose query
-            if (mongoose.connection.readyState === 1) {
-                try {
-                    const db = mongoose.connection.db;
-                    const yjsCollection = db.collection(this.config.collectionName);
-                    const deleteResult = await yjsCollection.deleteMany({ docName: docName });
-                    logger.debug('Cleared Yjs updates from MongoDB', {
-                        docName,
-                        deletedCount: deleteResult.deletedCount
-                    });
-                } catch (mongoErr) {
-                    logger.warn('Failed to clear Yjs document from MongoDB:', {
-                        filePath,
-                        docName,
-                        error: mongoErr.message
-                    });
-                }
-            }
-
-            // 2b. Also call provider's clearDocument to clear any internal caching
-            if (this.persistence) {
-                try {
-                    await this.persistence.clearDocument(docName);
-                } catch (clearErr) {
-                    logger.debug('Provider clearDocument (non-fatal):', { docName, error: clearErr.message });
-                }
-            }
-
-            // 3. Write the new content to MongoDB
-            if (initialContent && initialContent.trim()) {
-                const ydoc = new Y.Doc();
-                const ytext = ydoc.getText('content');
-                ytext.insert(0, initialContent);
-                await this.persistence.storeUpdate(docName, Y.encodeStateAsUpdate(ydoc));
-                this.documents.set(docName, ydoc);
-            }
-
-            logger.info('Yjs document initialized with content (no live clients)', {
-                filePath,
-                docName,
-                contentLength: initialContent?.length || 0
-            });
-        } catch (error) {
-            logger.error('Failed to initialize YJS document:', {
-                filePath,
-                error: error.message
-            });
-            throw error;
+        // Drop our own cache entry — it's about to be stale either way.
+        const cachedDoc = this.documents.get(docName);
+        const liveDoc = this.wsDocsMap?.get(docName) ?? null;
+        if (cachedDoc && cachedDoc !== liveDoc) {
+            cachedDoc.destroy();
         }
+        this.documents.delete(docName);
+
+        if (!this.coordinator) {
+            throw new Error('YjsService.initializeTextContent called before coordinator was wired');
+        }
+
+        await this.coordinator.replaceContent(docName, initialContent || '', { liveDoc });
+
+        logger.info('Yjs document content replaced', {
+            filePath,
+            docName,
+            contentLength: initialContent?.length || 0,
+            mode: liveDoc ? 'live-transaction' : 'mongo-direct',
+        });
     }
 
     /**
-     * Delete a Yjs document — removes from memory cache and MongoDB persistence
+     * Delete a Yjs document — clears MongoDB and (if connected clients exist)
+     * pushes the empty state to them via a live transaction.  Same coordinator
+     * path as initializeTextContent('') so epoch invalidation prevents stale
+     * writes after the delete.
      */
     async deleteDocument(filePath) {
         try {
             const docName = this.getDocumentName(filePath);
-
-            // Cancel any pending batched persistence writes BEFORE touching MongoDB so
-            // the stale 500 ms timer cannot re-write old content after we clear the doc.
-            this.cancelPendingUpdates(docName);
-
-            // Grab the live wsDoc reference before we touch the caches so we can
-            // apply an empty transaction to it in step 3.
-            const wsDoc = this.wsDocsMap?.get(docName) ?? null;
-
-            // 1a. Remove from our own in-memory cache first.
-            //     If the cached entry IS the wsDoc, only remove our pointer — the
-            //     y-websocket server still owns that Y.Doc and it must stay alive so
-            //     we can apply the empty transaction below.
             const cachedDoc = this.documents.get(docName);
-            if (cachedDoc) {
-                if (cachedDoc !== wsDoc) {
-                    cachedDoc.destroy();
-                }
-                this.documents.delete(docName);
+            const liveDoc = this.wsDocsMap?.get(docName) ?? null;
+            if (cachedDoc && cachedDoc !== liveDoc) {
+                cachedDoc.destroy();
             }
+            this.documents.delete(docName);
 
-            // 1b. Unbind from Redis adapter if active
             if (this.redisAdapter) {
-                try {
-                    await this.redisAdapter.removeAdapter(docName);
-                } catch (redisErr) {
+                try { await this.redisAdapter.removeAdapter(docName); }
+                catch (redisErr) {
                     logger.debug('Redis adapter cleanup during delete (non-fatal):', { docName, error: redisErr.message });
                 }
             }
 
-            // 2. Delete all Yjs updates from MongoDB using direct Mongoose query
-            if (mongoose.connection.readyState === 1) {
-                try {
-                    const db = mongoose.connection.db;
-                    const yjsCollection = db.collection(this.config.collectionName);
-                    const deleteResult = await yjsCollection.deleteMany({ docName: docName });
-                    logger.debug('Deleted Yjs updates from MongoDB', {
-                        docName,
-                        deletedCount: deleteResult.deletedCount
-                    });
-                } catch (mongoErr) {
-                    logger.warn('Failed to delete Yjs document from MongoDB:', {
-                        filePath,
-                        docName,
-                        error: mongoErr.message
-                    });
-                }
-            }
-
-            // 2b. Also call provider's clearDocument to ensure any internal state is cleared
-            if (this.persistence) {
-                try {
-                    await this.persistence.clearDocument(docName);
-                } catch (clearErr) {
-                    logger.debug('Provider clearDocument during delete (non-fatal):', { docName, error: clearErr.message });
-                }
-            }
-
-            // 3. If live WS clients are connected, apply an empty transaction to push
-            //    the "content deleted" state to them immediately.
-            //
-            //    DO NOT evict (close WS connections).  Eviction causes y-websocket to
-            //    auto-reconnect the moment the connection closes; the reconnecting
-            //    browser then sends its stale in-memory Y.Doc state before it receives
-            //    the file:deleted notification, re-populating MongoDB with the old
-            //    content immediately after we just cleared it.  This is the exact race
-            //    documented in initializeTextContent — and the fix is the same:
-            //
-            //      - Apply the content change as a transaction on the live wsDoc.
-            //      - The sync protocol broadcasts the delta to all connected clients.
-            //      - Clients see an empty editor and voluntarily disconnect when the
-            //        file:deleted notification arrives and clearFileSelection() fires.
-            //      - No eviction => no reconnect => no stale-state race.
-            if (wsDoc) {
-                wsDoc.transact(() => {
-                    const ytext = wsDoc.getText('content');
-                    ytext.delete(0, ytext.length);
-                });
-                logger.info('Yjs document content cleared via transaction (delete, no eviction)', {
-                    filePath,
-                    docName
-                });
+            if (this.coordinator) {
+                await this.coordinator.replaceContent(docName, '', { liveDoc });
             }
 
             logger.info('Yjs document deleted', { filePath, docName });
         } catch (error) {
-            logger.error('Failed to delete Yjs document:', {
-                filePath,
-                error: error.message
-            });
+            logger.error('Failed to delete Yjs document:', { filePath, error: error.message });
             // Don't throw — deletion should not fail the parent operation
         }
     }
@@ -1364,10 +1471,8 @@ class YjsService {
 
     /**
      * Provide the @y/websocket-server `docs` Map so that
-     * deleteDocument / initializeTextContent can also evict the in-memory
-     * WSSharedDoc.  Without this, a deleted-then-reuploaded file would
-     * resurrect stale content from the old in-memory doc.
-     * Call this once after setting up the WebSocket server in server.js.
+     * deleteDocument / initializeTextContent can apply transactions to
+     * the in-memory WSSharedDoc when clients are connected.
      */
     setWsDocsMap(docsMap) {
         this.wsDocsMap = docsMap;
@@ -1375,33 +1480,15 @@ class YjsService {
     }
 
     /**
-     * Register a cancel function for a document's pending persistence timeout.
-     * Called from server.js bindState so we can abort in-flight batched writes
-     * before clearing / re-seeding the document.
+     * Wire the PersistenceCoordinator (created in server.js where the
+     * @y/websocket-server `setPersistence` callbacks are registered).
+     * YjsService delegates all replace-content / delete flows to it so a
+     * single source of truth owns batched writes, epoch invalidation, and
+     * writeState gating.
      */
-    registerCancelFn(docName, fn) {
-        this.cancelFns.set(docName, fn);
-    }
-
-    /**
-     * Remove the cancel function for a document (called after it fires normally).
-     */
-    unregisterCancelFn(docName) {
-        this.cancelFns.delete(docName);
-    }
-
-    /**
-     * Cancel any pending persistence batching for `docName` and clear its
-     * queued updates, so stale data is never written back after a
-     * clearDocument / storeUpdate cycle.
-     */
-    cancelPendingUpdates(docName) {
-        const fn = this.cancelFns.get(docName);
-        if (fn) {
-            fn();
-            this.cancelFns.delete(docName);
-            logger.debug('Cancelled pending persistence timeout', { docName });
-        }
+    setCoordinator(coordinator) {
+        this.coordinator = coordinator;
+        logger.info('YjsService: persistence coordinator wired');
     }
 
     /**
@@ -1746,6 +1833,11 @@ export {
     YjsRedisAdapter,
     YjsService,
     getYjsService,
+    PersistenceCoordinator,
+    docNameFromFilePath,
+    filePathFromDocName,
+    docNameFromUrlPath,
+    normalizeFilePath,
 
     // File notification functionality
     FileNotificationService,

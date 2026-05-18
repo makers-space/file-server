@@ -9,16 +9,10 @@ import mongoose from 'mongoose';
 import dotenv from 'dotenv';
 import http from 'node:http';
 import WebSocket from 'ws';
-import * as Y from 'yjs';
 import {setupWSConnection, setPersistence, docs} from '@y/websocket-server/utils';
 
 // Load environment variables FIRST before importing other local modules
 dotenv.config({path: path.resolve(process.cwd(), '.env')});
-
-const encodingModule = await import('lib0/encoding');
-const encoding = encodingModule.default ?? encodingModule;
-const syncProtocolModule = await import('y-protocols/sync');
-const syncProtocol = syncProtocolModule.default ?? syncProtocolModule;
 
 const loggerModule = await import('./utils/app.logger.js');
 const logger = loggerModule.default ?? loggerModule.logger ?? loggerModule;
@@ -39,7 +33,13 @@ const cacheControllerModule = await import('./controllers/cache.controller.js');
 const {cleanupService} = cacheControllerModule;
 
 const fileMiddleware = await import('./middleware/file.middleware.js');
-const {getFileNotificationService, getYjsService} = fileMiddleware;
+const {
+    getFileNotificationService,
+    getYjsService,
+    PersistenceCoordinator,
+    docNameFromUrlPath,
+    filePathFromDocName,
+} = fileMiddleware;
 const notificationService = getFileNotificationService();
 
 const {redisClient} = appMiddleware;
@@ -390,194 +390,56 @@ class Server {
                         const persistence = yjsService?.getPersistence?.();
 
                         if (persistence) {
+                            // Single coordinator owns: per-doc epoch (for stale-batch invalidation),
+                            // batched writes (one timer per doc covering both Yjs snapshot AND
+                            // file `updatedAt` so they stay consistent), and writeState gating so
+                            // a reconnecting bindState always sees the freshest MongoDB state.
+                            // Replaces the previous ad-hoc writeStatePromises Map, the
+                            // cancelFn registry, the dual 500ms/3000ms debouncers, and the
+                            // manual compaction race that used to live inline here.
+                            const coordinator = new PersistenceCoordinator({
+                                persistence,
+                                touchFileMetadata: async (docName) => {
+                                    const filePath = filePathFromDocName(docName);
+                                    await FileModel.updateOne(
+                                        { filePath, type: { $in: ['text', 'binary'] } },
+                                        { updatedAt: new Date() }
+                                    );
+                                },
+                            });
+
+                            // Hand the coordinator + persistence to YjsService so create/delete/
+                            // overwrite flows go through replaceContent (epoch-based) rather than
+                            // racing with the live update listener.
+                            yjsService?.setCoordinator?.(coordinator);
+
                             setPersistence({
                                 provider: persistence,
                                 bindState: async (docName, ydoc) => {
+                                    await coordinator.bindState(docName, ydoc);
+                                    // Redis cross-server sync (optional, non-fatal)
                                     try {
-                                        // Load persisted state from MongoDB
-                                        const persistedYdoc = await persistence.getYDoc(docName);
-                                        const persistedUpdate = Y.encodeStateAsUpdate(persistedYdoc);
-
-                                        // Apply persisted state to ensure consistency (idempotent)
-                                        if (persistedUpdate.length > 0) {
-                                            Y.applyUpdate(ydoc, persistedUpdate);
-                                        }
-
-                                        // Setup MongoDB persistence for updates with optimized batching
-                                        let updateTimeout = null;
-                                        let persistenceTimeout = null;
-                                        const pendingUpdates = new Set();
-                                        const pendingPersistenceUpdates = new Map(); // docName -> updates array
-                                        
-                                        ydoc.on('update', async (update) => {
-                                            try {
-                                                // Batch persistence updates to reduce MongoDB writes
-                                                if (!pendingPersistenceUpdates.has(docName)) {
-                                                    pendingPersistenceUpdates.set(docName, []);
-                                                }
-                                                pendingPersistenceUpdates.get(docName).push(update);
-                                                
-                                                // Clear existing persistence timeout
-                                                if (persistenceTimeout) {
-                                                    clearTimeout(persistenceTimeout);
-                                                }
-                                                
-                                                // Batch persistence writes every 500ms for better performance
-                                                persistenceTimeout = setTimeout(async () => {
-                                                    for (const [docNameToPersist, updates] of pendingPersistenceUpdates) {
-                                                        try {
-                                                            // Store all batched updates
-                                                            for (const batchedUpdate of updates) {
-                                                                await persistence.storeUpdate(docNameToPersist, batchedUpdate);
-                                                            }
-
-                                                        } catch (batchError) {
-                                                            logger.error('Failed to store batched Yjs updates', {
-                                                                docName: docNameToPersist,
-                                                                updateCount: updates.length,
-                                                                error: batchError.message
-                                                            });
-                                                        }
-                                                    }
-                                                    pendingPersistenceUpdates.clear();
-                                                    persistenceTimeout = null;
-                                                    // Unregister cancel fn once it has fired naturally
-                                                    if (yjsService?.unregisterCancelFn) yjsService.unregisterCancelFn(docName);
-                                                }, 500); // 500ms batching for persistence
-                                                
-                                                // Debounce File model updates to avoid performance issues (longer delay)
-                                                pendingUpdates.add(docName);
-                                                
-                                                // Clear existing timeout
-                                                if (updateTimeout) {
-                                                    clearTimeout(updateTimeout);
-                                                }
-                                                
-                                                // Set new timeout to update file metadata after 3 seconds of inactivity
-                                                updateTimeout = setTimeout(async () => {
-                                                    for (const docNameToUpdate of pendingUpdates) {
-                                                        try {
-                                                            // Convert Yjs document name back to file path
-                                                            const filePath = docNameToUpdate.startsWith('yjs/') ? 
-                                                                '/' + docNameToUpdate.substring(4) : // Remove 'yjs/' prefix and add leading slash
-                                                                '/' + docNameToUpdate; // Add leading slash if no prefix
-                                                            
-                                                            // Update the file metadata to reflect the content change
-                                                            // Match both text files and binary files that use Yjs (e.g. DOCX)
-                                                            await FileModel.updateOne(
-                                                                { filePath: filePath, type: { $in: ['text', 'binary'] } },
-                                                                { updatedAt: new Date() }
-                                                            );
-                                                            
-                                                            logger.debug('Updated file metadata after Yjs content changes', {
-                                                                docName: docNameToUpdate,
-                                                                filePath
-                                                            });
-                                                        } catch (fileUpdateError) {
-                                                            logger.error('Failed to update file metadata', {
-                                                                docName: docNameToUpdate,
-                                                                error: fileUpdateError.message
-                                                            });
-                                                        }
-                                                    }
-                                                    pendingUpdates.clear();
-                                                    updateTimeout = null;
-                                                }, 3000); // 3 second debounce for metadata updates
-                                                
-                                            } catch (storeError) {
-                                                logger.error('Failed to handle Yjs update', {
-                                                    docName,
-                                                    error: storeError.message
-                                                });
-                                            }
-                                        });
-
-                                        // Register a cancel function so YjsService can abort the pending
-                                        // 500 ms persistence batch before clearing / re-seeding a document.
-                                        // Without this, stale updates would be written back to MongoDB
-                                        // AFTER clearDocument + storeUpdate(fresh) have already run.
-                                        if (yjsService?.registerCancelFn) {
-                                            yjsService.registerCancelFn(docName, () => {
-                                                if (persistenceTimeout) {
-                                                    clearTimeout(persistenceTimeout);
-                                                    persistenceTimeout = null;
-                                                }
-                                                pendingPersistenceUpdates.delete(docName);
-                                            });
-                                        }
-
-                                        // Bind Redis adapter for cross-server synchronization
-                                        try {
-                                            const redisAdapter = await yjsService?.bindRedisAdapter?.(docName, ydoc);
-                                            if (redisAdapter) {
-                                                logger.debug('Redis adapter bound for cross-server sync', { docName });
-                                            }
-                                        } catch (redisError) {
-                                            logger.warn('Failed to bind Redis adapter, continuing with MongoDB-only persistence', {
-                                                docName,
-                                                error: redisError.message
-                                            });
-                                        }
-
-                                        // Compact: replace potentially thousands of stored
-                                        // update records with a single merged snapshot so
-                                        // future loads are fast.  We already have the merged
-                                        // state in ydoc, so this is just a write.
-                                        try {
-                                            const compactedState = Y.encodeStateAsUpdate(ydoc);
-                                            await persistence.clearDocument(docName);
-                                            if (compactedState.length > 2) {
-                                                await persistence.storeUpdate(docName, compactedState);
-                                            }
-                                        } catch (compactErr) {
-                                            logger.warn('Non-fatal: Yjs compaction failed', { docName, error: compactErr.message });
-                                        }
-
-                                        persistedYdoc.destroy();
-                                    } catch (error) {
-                                        logger.error('Failed to bind Yjs persistence state', {
-                                            docName,
-                                            error: error.message
+                                        await yjsService?.bindRedisAdapter?.(docName, ydoc);
+                                    } catch (redisError) {
+                                        logger.warn('Redis adapter bind failed; continuing MongoDB-only', {
+                                            docName, error: redisError.message
                                         });
                                     }
                                 },
                                 writeState: async (docName, ydoc) => {
+                                    await coordinator.writeState(docName, ydoc);
                                     try {
-                                        // Cancel the 500ms batching timer — we will persist
-                                        // the full in-memory state ourselves right now.
-                                        if (yjsService?.cancelPendingUpdates) {
-                                            yjsService.cancelPendingUpdates(docName);
-                                        }
-
-                                        // Capture the FULL in-memory state (includes edits
-                                        // the batching timer hasn't persisted yet).  Then
-                                        // replace all accumulated MongoDB records with a
-                                        // single compacted snapshot.  This fixes the race
-                                        // where a refresh loses recent edits and also keeps
-                                        // the collection small for fast future loads.
-                                        const fullState = Y.encodeStateAsUpdate(ydoc);
-                                        await persistence.clearDocument(docName);
-                                        if (fullState.length > 2) {
-                                            await persistence.storeUpdate(docName, fullState);
-                                        }
-                                        
-                                        // Unbind Redis adapter when document is being written/closed
-                                        try {
-                                            await yjsService?.unbindRedisAdapter?.(docName, ydoc);
-                                        } catch (redisError) {
-                                            logger.warn('Failed to unbind Redis adapter during writeState', {
-                                                docName,
-                                                error: redisError.message
-                                            });
-                                        }
-                                    } catch (error) {
-                                        logger.error('Failed to flush Yjs persistence state', {
-                                            docName,
-                                            error: error.message
+                                        await yjsService?.unbindRedisAdapter?.(docName, ydoc);
+                                    } catch (redisError) {
+                                        logger.warn('Redis adapter unbind failed', {
+                                            docName, error: redisError.message
                                         });
                                     }
-                                }
+                                },
                             });
+
+                            // Track coordinator for shutdown flush.
+                            this.persistenceCoordinator = coordinator;
 
                             const redisStats = yjsService?.getRedisStats?.() ?? {isEnabled: false, isConnected: false};
                             if (redisStats.isEnabled && redisStats.isConnected) {
@@ -589,79 +451,58 @@ class Server {
                             logger.warn('Yjs WebSocket server started without persistence binding; collaborative changes will not be persisted.');
                         }
                         
-                        // Handle WebSocket connections with authentication
+                        // ── WebSocket route table ───────────────────────────────────
+                        // Single dispatch point: path prefix -> handler.  Keeps the
+                        // connection callback short and makes adding new WS endpoints
+                        // a one-line change.
+                        const wsRoutes = [
+                            {
+                                prefix: '/notifications',
+                                handle: (ws, req) => notificationService.handleConnection(ws, req),
+                            },
+                            {
+                                prefix: '/yjs/',
+                                handle: async (ws, req) => {
+                                    if (!persistence) {
+                                        logger.error('Yjs persistence not initialized');
+                                        ws.close(1011, 'Persistence unavailable');
+                                        return;
+                                    }
+                                    const user = await authMiddleware.authenticateWebSocket?.(ws, req);
+                                    // Canonical docName from URL.  All layers (docs map,
+                                    // MongoDB key, yjsService) use this same un-encoded form.
+                                    const docName = docNameFromUrlPath(req.url);
+                                    const filePath = filePathFromDocName(docName);
+                                    const file = await FileModel.findOne({ filePath });
+                                    if (!file) {
+                                        logger.warn('Yjs auth: file not found', { filePath, userId: user?.id });
+                                        ws.close(4404, 'File not found');
+                                        return;
+                                    }
+                                    if (!file.hasReadAccess(user.id)) {
+                                        logger.warn('Yjs auth: access denied', { filePath, userId: user.id });
+                                        ws.close(4403, 'Access denied');
+                                        return;
+                                    }
+                                    setupWSConnection(ws, req, { docName, gc: false });
+                                    logger.debug('Yjs WebSocket connection established', { userId: user.id, docName });
+                                },
+                            },
+                        ];
+
                         wss.on('connection', async (ws, req) => {
                             try {
-                                const urlPath = req.url.split('?')[0];
-                                
-                                if (urlPath === '/notifications') {
-                                    // This is a notification WebSocket connection - let the notification service handle it
-                                    notificationService.handleConnection(ws, req);
-                                    return;
-                                } else if (!urlPath.startsWith('/yjs/')) {
+                                const urlPath = (req.url || '').split('?')[0];
+                                const route = wsRoutes.find(r => urlPath === r.prefix || urlPath.startsWith(r.prefix));
+                                if (!route) {
                                     logger.warn('Invalid WebSocket path, rejecting connection', { urlPath });
                                     ws.close(1008, 'Invalid path');
                                     return;
                                 }
-                                
-                                // Continue with Yjs WebSocket handling
-
-                                if (!persistence) {
-                                    logger.error('Yjs persistence not initialized');
-                                    ws.close(1011, 'Persistence unavailable');
-                                    return;
-                                }
-
-                                // Authenticate WebSocket connection
-                                const user = await authMiddleware.authenticateWebSocket?.(ws, req);
-
-                                // Extract document name from URL.
-                                // CRITICAL: URL-decode the path so the docs-map key matches
-                                // the names produced by yjsService.getDocumentName().
-                                // Without this, filenames containing spaces or special chars
-                                // (e.g. "resume for AYODEJI (updated).docx") end up stored
-                                // under the percent-encoded key in the docs map, while
-                                // initializeTextContent / deleteDocument look up the
-                                // non-encoded key — causing stale-content mismatches.
-                                const docNameFromUrl = decodeURIComponent(
-                                    req.url.slice(1).split('?')[0]
-                                );
-
-                                // ── Authorization: verify the user may access this file ──
-                                // docName format is "yjs/<filePath>" e.g. "yjs/userone/file.txt"
-                                // Strip the "yjs" prefix to recover the database filePath.
-                                const filePath = '/' + docNameFromUrl.replace(/^yjs\//, '');
-                                const file = await FileModel.findOne({ filePath });
-                                if (!file) {
-                                    logger.warn('Yjs auth: file not found', { filePath, userId: user?.id });
-                                    ws.close(4404, 'File not found');
-                                    return;
-                                }
-                                if (!file.hasReadAccess(user.id)) {
-                                    logger.warn('Yjs auth: access denied', { filePath, userId: user.id });
-                                    ws.close(4403, 'Access denied');
-                                    return;
-                                }
-                                
-                                // Call setupWSConnection which handles the Yjs sync protocol  
-                                // This will create or retrieve the Y.Doc from the docs cache
-                                // gc: false prevents aggressive garbage collection that might
-                                // cause documents to be prematurely removed from memory
-                                // Pass the decoded docName explicitly so every layer uses
-                                // the same un-encoded key (docs map, MongoDB, yjsService).
-                                setupWSConnection(ws, req, {
-                                    docName: docNameFromUrl,
-                                    gc: false  // Keep documents in memory for better collaboration
-                                });
-
-                                logger.debug('Yjs WebSocket connection established', {
-                                    userId: user.id,
-                                    docName: docNameFromUrl
-                                });
-                                
+                                await route.handle(ws, req);
                             } catch (error) {
-                                logger.error('Yjs WebSocket authentication error:', error);
-                                ws.close(1008, 'Authentication failed');
+                                logger.error('WebSocket connection error:', error);
+                                try { ws.close(1008, 'Authentication failed'); } catch { /* already closed */ }
                             }
                         });
                         
@@ -674,11 +515,8 @@ class Server {
                         this.yjsWebSocketServer = wss;
 
                         // Give YjsService a reference to the WS server's in-memory
-                        // docs Map so that deleteDocument / initializeTextContent can
-                        // evict stale documents and force a fresh bindState on reconnect.
-                        if (yjsService?.setWsDocsMap) {
-                            yjsService.setWsDocsMap(docs);
-                        }
+                        // docs Map so replaceContent can operate on live wsDocs.
+                        yjsService?.setWsDocsMap?.(docs);
                         
                         logger.info('✅ Integrated Yjs WebSocket server running on /yjs path');
                         
@@ -779,6 +617,17 @@ class Server {
                             logger.warn('Error closing integrated Yjs WebSocket server:', err.message);
                         }
                         this.yjsWebSocketServer = null;
+                    }
+
+                    // Flush pending Yjs writes before exit
+                    if (this.persistenceCoordinator) {
+                        try {
+                            await this.persistenceCoordinator.shutdown();
+                            logger.info('Yjs persistence coordinator flushed');
+                        } catch (err) {
+                            logger.warn('Error flushing persistence coordinator:', err.message);
+                        }
+                        this.persistenceCoordinator = null;
                     }
 
                     // Shutdown notification WebSocket service
