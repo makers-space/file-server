@@ -486,14 +486,59 @@ class Server {
                                     }
                                     const liveDoc = docs.get(docName);
                                     const connsBefore = liveDoc ? liveDoc.conns.size : 0;
+                                    // --- TEMP DIAGNOSTIC: wrap ws.send + raw message listener to trace per-conn frames
+                                    const __connId = Math.random().toString(36).slice(2, 8);
+                                    const __origSend = ws.send.bind(ws);
+                                    ws.send = (data, ...rest) => {
+                                        try {
+                                            const len = data?.byteLength ?? data?.length ?? 0;
+                                            let kind = 'other';
+                                            if (data instanceof Uint8Array && data.length > 0) {
+                                                // message type is first varuint byte (0=sync, 1=awareness)
+                                                const t = data[0];
+                                                if (t === 0 && data.length > 1) {
+                                                    // sync subtype is next varuint byte
+                                                    kind = `sync-step-${data[1]}`;
+                                                } else if (t === 1) {
+                                                    kind = 'awareness';
+                                                } else {
+                                                    kind = `type-${t}`;
+                                                }
+                                            }
+                                            logger.info('[Yjs] WS SEND', { connId: __connId, docName, len, kind });
+                                        } catch {}
+                                        return __origSend(data, ...rest);
+                                    };
+                                    ws.on('message', (data) => {
+                                        try {
+                                            const buf = data instanceof Buffer ? data : Buffer.from(data);
+                                            let kind = 'other';
+                                            if (buf.length > 0) {
+                                                const t = buf[0];
+                                                if (t === 0 && buf.length > 1) kind = `sync-step-${buf[1]}`;
+                                                else if (t === 1) kind = 'awareness';
+                                                else kind = `type-${t}`;
+                                            }
+                                            logger.info('[Yjs] WS RECV', { connId: __connId, docName, len: buf.length, kind });
+                                        } catch {}
+                                    });
                                     setupWSConnection(ws, req, { docName, gc: false });
                                     const liveDocAfter = docs.get(docName);
                                     const connsAfter = liveDocAfter ? liveDocAfter.conns.size : 0;
-                                    logger.info('[Yjs] WS CONNECT', { userId: user.id, docName, connsBefore, connsAfter });
+                                    let docStateLen = 0;
+                                    let docContentTextLen = 0;
+                                    try {
+                                        if (liveDocAfter) {
+                                            docStateLen = (await import('yjs')).encodeStateAsUpdate(liveDocAfter).length;
+                                            docContentTextLen = liveDocAfter.getText('content').toString().length;
+                                        }
+                                    } catch {}
+                                    logger.info('[Yjs] WS CONNECT', { connId: __connId, userId: user.id, docName, connsBefore, connsAfter, docStateLen, docContentTextLen });
                                     ws.on('close', (code, reason) => {
                                         const ld = docs.get(docName);
                                         const remaining = ld ? ld.conns.size : 0;
                                         logger.info('[Yjs] WS CLOSE', {
+                                            connId: __connId,
                                             userId: user.id,
                                             docName,
                                             code,
