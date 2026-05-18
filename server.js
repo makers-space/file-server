@@ -484,8 +484,23 @@ class Server {
                                         ws.close(4403, 'Access denied');
                                         return;
                                     }
+                                    const liveDoc = docs.get(docName);
+                                    const connsBefore = liveDoc ? liveDoc.conns.size : 0;
                                     setupWSConnection(ws, req, { docName, gc: false });
-                                    logger.debug('Yjs WebSocket connection established', { userId: user.id, docName });
+                                    const liveDocAfter = docs.get(docName);
+                                    const connsAfter = liveDocAfter ? liveDocAfter.conns.size : 0;
+                                    logger.info('[Yjs] WS CONNECT', { userId: user.id, docName, connsBefore, connsAfter });
+                                    ws.on('close', (code, reason) => {
+                                        const ld = docs.get(docName);
+                                        const remaining = ld ? ld.conns.size : 0;
+                                        logger.info('[Yjs] WS CLOSE', {
+                                            userId: user.id,
+                                            docName,
+                                            code,
+                                            reason: reason?.toString?.() || '',
+                                            remaining,
+                                        });
+                                    });
                                 },
                             },
                         ];
@@ -501,8 +516,17 @@ class Server {
                                 }
                                 await route.handle(ws, req);
                             } catch (error) {
-                                logger.error('WebSocket connection error:', error);
-                                try { ws.close(1008, 'Authentication failed'); } catch { /* already closed */ }
+                                // Auth failures are common (expired tokens from stale tabs).
+                                // Log at debug to avoid flooding production logs, and close
+                                // with 4401 so well-behaved clients can stop retrying.
+                                const isAuthError = /token|auth/i.test(error?.message || '');
+                                if (isAuthError) {
+                                    logger.debug('WebSocket auth rejected', { url: req.url, message: error.message });
+                                    try { ws.close(4401, 'Authentication failed'); } catch { /* already closed */ }
+                                } else {
+                                    logger.error('WebSocket connection error:', error);
+                                    try { ws.close(1008, 'Connection error'); } catch { /* already closed */ }
+                                }
                             }
                         });
                         
