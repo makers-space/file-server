@@ -462,6 +462,34 @@ export const fileSchemas = {
         description: Joi.string().min(0).max(500)
     }),
 
+    updateFileMetadata: Joi.object({
+        fileName: Joi.string().trim().min(1).max(255),
+        description: Joi.string().allow('').max(500),
+        tags: Joi.array().items(Joi.string().trim().max(50)).max(10),
+        permissions: Joi.object({
+            read: Joi.array().items(Joi.objectId()),
+            write: Joi.array().items(Joi.objectId())
+        }),
+        mediaMetadata: Joi.object({
+            title: Joi.string().allow('', null).max(200),
+            artist: Joi.string().allow('', null).max(200),
+            album: Joi.string().allow('', null).max(200),
+            year: Joi.number().integer().min(0).max(9999).allow(null),
+            genre: Joi.string().allow('', null).max(100),
+            track: Joi.number().integer().min(0).allow(null),
+            albumArtist: Joi.string().allow('', null).max(200),
+            // Cover art is sent as a base64 data URL; the controller resizes
+            // it and stores in GridFS. Use null to clear the existing cover.
+            // ~20MB base64 string ≈ 15MB binary, generous for album art.
+            cover: Joi.string()
+                .pattern(/^data:image\/[a-zA-Z0-9.+-]+;base64,/)
+                .max(20 * 1024 * 1024)
+                .allow(null)
+        })
+    }).min(1).messages({
+        'object.min': 'At least one field must be provided to update'
+    }),
+
     createVersion: Joi.object({
         message: Joi.string().max(200)
             .default('Version saved')
@@ -514,9 +542,8 @@ export const fileSchemas = {
     }),
 
     getDirectoryContents: Joi.object({
-        filePath: Joi.string().pattern(/^\/([a-zA-Z0-9._/-]*[a-zA-Z0-9._-])?$/).required()
+        filePath: Joi.filePath().required()
             .messages({
-                'string.pattern.base': 'File path must be a valid filesystem path starting with /',
                 'any.required': 'File path is required'
             }),
         sortBy: Joi.string().valid('fileName', 'fileType', 'size', 'createdAt', 'updatedAt').default('fileName'),

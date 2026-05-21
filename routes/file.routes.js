@@ -289,6 +289,20 @@ router.get('/:filePath/metadata',
     fileController.getFileMetadata
 );
 
+/**
+ * @route   PUT /api/v1/files/:filePath/metadata
+ * @desc    Update editable file metadata (fileName, description, tags,
+ *          permissions, mediaMetadata for audio/video). Content is NOT
+ *          updated here — use /content for binary or Yjs for text.
+ * @access  Private (requires write permission)
+ */
+router.put('/:filePath/metadata',
+    validateRequest(fileParamSchemas.filePath, 'params'),
+    validateRequest(fileSchemas.updateFileMetadata),
+    autoInvalidateCache('file', (req) => req.params.filePath, (req) => req.user.id),
+    fileController.updateFileMetadata
+);
+
 router.get('/:filePath/content',
     validateRequest(fileParamSchemas.filePath, 'params'),
     fileController.getFileContent

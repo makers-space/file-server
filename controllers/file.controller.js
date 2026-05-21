@@ -20,6 +20,7 @@ import {renameInGridFS, getGridFSBucket, storeInGridFS, retrieveFromGridFS} from
 import {parseBuffer} from 'music-metadata';
 import ffmpeg from 'fluent-ffmpeg';
 import HTMLtoDOCX from 'html-to-docx';
+import JSZip from 'jszip';
 import sharp from 'sharp';
 import {sanitizeHtmlInput} from '../utils/sanitize.js';
 
@@ -827,7 +828,7 @@ const fileController = {
     updateFileMetadata: asyncHandler(async (req, res) => {
         const {filePath} = req.params;
         const decodedFilePath = decodeFilePath(filePath);
-        const {fileName, description, tags, permissions} = req.body;
+        const {fileName, description, tags, permissions, mediaMetadata} = req.body;
         const userId = getUserId(req);
         const userRoles = req.user?.roles || [];
 
@@ -904,6 +905,83 @@ const fileController = {
             hasChanges = true;
         }
 
+        // Handle mediaMetadata updates (audio/video tag fields + cover art).
+        // Only the user-editable subset of mediaMetadata is accepted here;
+        // technical fields (duration, bitrate, width, height, fps, codecs,
+        // thumbnailId) are computed on upload and not editable. The cover
+        // image arrives as a base64 data URL in `mediaMetadata.cover`; it is
+        // resized, written to GridFS, and reflected as coverArtId.
+        if (mediaMetadata !== undefined && mediaMetadata !== null && typeof mediaMetadata === 'object') {
+            if (file.type !== 'binary' || !(file.mimeType?.startsWith('audio/') || file.mimeType?.startsWith('video/'))) {
+                throw new AppError('mediaMetadata can only be updated on audio or video files', 400);
+            }
+            const EDITABLE_MEDIA_FIELDS = [
+                'title', 'artist', 'album', 'year', 'genre',
+                'track', 'albumArtist'
+            ];
+            const mediaUpdates = {};
+            let mediaChanged = false;
+            const current = file.mediaMetadata?.toObject?.() ?? file.mediaMetadata ?? {};
+            for (const key of EDITABLE_MEDIA_FIELDS) {
+                if (!Object.prototype.hasOwnProperty.call(mediaMetadata, key)) continue;
+                const incoming = mediaMetadata[key];
+                // Normalize: empty string -> null/undefined to clear the field.
+                const normalized = (incoming === '' || incoming === null) ? null : incoming;
+                if (current[key] !== normalized) {
+                    mediaUpdates[key] = normalized;
+                    mediaChanged = true;
+                }
+            }
+
+            // Cover art: accept a data URL (data:image/<type>;base64,<...>) and
+            // replace the existing GridFS object. Cleared with cover === null.
+            if (Object.prototype.hasOwnProperty.call(mediaMetadata, 'cover')) {
+                const cover = mediaMetadata.cover;
+                const previousId = current.coverArtId;
+                if (cover === null || cover === '') {
+                    if (previousId) {
+                        try { await getGridFSBucket().delete(previousId); }
+                        catch (err) { logger.warn('Failed to delete previous cover art', { fileId: file._id, error: err.message }); }
+                        mediaUpdates.coverArtId = null;
+                        mediaChanged = true;
+                    }
+                } else if (typeof cover === 'string') {
+                    const match = /^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/.exec(cover);
+                    if (!match) {
+                        throw new AppError('cover must be a base64 data URL (data:image/<type>;base64,...)', 400);
+                    }
+                    const buf = Buffer.from(match[2], 'base64');
+                    let resized;
+                    try {
+                        resized = await sharp(buf)
+                            .resize(500, 500, { fit: 'inside', withoutEnlargement: true })
+                            .jpeg({ quality: 85 })
+                            .toBuffer();
+                    } catch (err) {
+                        throw new AppError(`Invalid cover image: ${err.message}`, 400);
+                    }
+                    if (previousId) {
+                        try { await getGridFSBucket().delete(previousId); }
+                        catch (err) { logger.warn('Failed to delete previous cover art (continuing)', { fileId: file._id, error: err.message }); }
+                    }
+                    const stored = await storeInGridFS(
+                        `${file._id}_cover.jpg`,
+                        resized,
+                        { mimeType: 'image/jpeg' }
+                    );
+                    mediaUpdates.coverArtId = stored._id;
+                    mediaChanged = true;
+                } else {
+                    throw new AppError('cover must be a base64 data URL string or null', 400);
+                }
+            }
+
+            if (mediaChanged) {
+                updates.mediaMetadata = { ...current, ...mediaUpdates };
+                hasChanges = true;
+            }
+        }
+
         // Handle permissions (only file owners or admins can update)
         if (permissions !== undefined) {
             const canUpdatePermissions = file.owner.toString() === userId || hasAdminAccess;
@@ -957,6 +1035,7 @@ const fileController = {
                 description: file.description,
                 tags: file.tags,
                 permissions: file.permissions,
+                mediaMetadata: file.mediaMetadata,
                 lastModifiedBy: file.lastModifiedBy,
                 updatedAt: file.updatedAt
             }
