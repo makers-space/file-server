@@ -55,6 +55,6 @@ commentSchema.index({file: 1, createdAt: -1});
 // Thread lookup
 commentSchema.index({parentComment: 1, createdAt: 1});
 
-const Comment = mongoose.models.Comment || mongoose.model('Comment', commentSchema);
+const Comment = mongoose.model('Comment', commentSchema);
 
 export default Comment;

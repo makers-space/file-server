@@ -14,23 +14,18 @@ import {setupWSConnection, setPersistence, docs} from '@y/websocket-server/utils
 // Load environment variables FIRST before importing other local modules
 dotenv.config({path: path.resolve(process.cwd(), '.env')});
 
-const loggerModule = await import('./utils/app.logger.js');
-const logger = loggerModule.default ?? loggerModule.logger ?? loggerModule;
+const {default: logger} = await import('./utils/app.logger.js');
 
-const dbModule = await import('./config/db.js');
-const {connectDB} = dbModule;
+const {connectDB} = await import('./config/db.js');
 
-const errorHandlerModule = await import('./middleware/error.middleware.js');
-const errorHandler = errorHandlerModule.default ?? errorHandlerModule.errorHandler ?? errorHandlerModule;
+const {default: errorHandler} = await import('./middleware/error.middleware.js');
 
 const appMiddleware = await import('./middleware/app.middleware.js');
 const appController = await import('./controllers/app.controller.js');
 
-const cacheMiddleware = await import('./middleware/cache.middleware.js');
-const {noCacheResponse} = cacheMiddleware;
+const {noCacheResponse} = await import('./middleware/cache.middleware.js');
 
-const cacheControllerModule = await import('./controllers/cache.controller.js');
-const {cleanupService} = cacheControllerModule;
+const {cleanupService} = await import('./controllers/cache.controller.js');
 
 const fileMiddleware = await import('./middleware/file.middleware.js');
 const {
@@ -74,7 +69,7 @@ class Server {
             port: process.env.PORT,
             environment: process.env.NODE_ENV,
             mongoUri: process.env.MONGODB_URI,
-            cacheEnabled: process.env.CACHE_ENABLED !== 'false',
+            cacheEnabled: process.env.CACHE_ENABLED === 'true',
             allowedOrigins: process.env.ALLOWED_ORIGINS ? process.env.ALLOWED_ORIGINS.split(',') : []
         };
 
@@ -113,14 +108,50 @@ class Server {
      */
     validateEnvironment() {
         const requiredEnvVars = [
-            'PORT',
-            'NODE_ENV',
-            'MONGODB_URI',
-            'ALLOWED_ORIGINS',
-            'ACCESS_TOKEN_SECRET',
-            'REFRESH_TOKEN_SECRET',
             'ACCESS_TOKEN_EXPIRY',
-            'REFRESH_TOKEN_EXPIRY'
+            'ACCESS_TOKEN_SECRET',
+            'ALLOWED_ORIGINS',
+            'APP_NAME',
+            'APP_URL',
+            'AUTO_COMPRESS',
+            'BLOCKED_FILE_EXTENSIONS',
+            'BCRYPT_ROUNDS',
+            'CACHE_CLEANUP_ENABLED',
+            'CACHE_CLEANUP_INTERVAL_HOURS',
+            'CACHE_CLEANUP_MAX_KEYS_PER_RUN',
+            'CACHE_CLEANUP_MIN_AGE_HOURS',
+            'CACHE_ENABLED',
+            'COMPRESSION_ALGORITHM',
+            'COMPRESSION_LEVEL',
+            'COMPRESSION_MIN_RATIO',
+            'COMPRESSION_MIN_SIZE',
+            'EMAIL_ENABLED',
+            'EMAIL_FROM',
+            'EMAIL_HOST',
+            'EMAIL_PASS',
+            'EMAIL_PORT',
+            'EMAIL_USER',
+            'EXTERNAL_SHARE_MAX_CONTENT_BYTES',
+            'EXTERNAL_SHARE_TIMEOUT_MS',
+            'LOG_LEVEL',
+            'MAX_REQUEST_SIZE',
+            'MONGODB_URI',
+            'NODE_ENV',
+            'PORT',
+            'RATE_LIMIT_AUTH_MAX_REQUESTS',
+            'RATE_LIMIT_AUTH_WINDOW_MS',
+            'RATE_LIMIT_MAX_REQUESTS',
+            'RATE_LIMIT_WINDOW_MS',
+            'REDIS_URL',
+            'REFRESH_TOKEN_EXPIRY',
+            'REFRESH_TOKEN_SECRET',
+            'YJS_COLLECTION_NAME',
+            'YJS_DEBOUNCE_DELAY',
+            'YJS_FLUSH_DELAY_MS',
+            'YJS_FLUSH_SIZE',
+            'YJS_REDIS_CHANNEL_PREFIX',
+            'YJS_REDIS_ENABLED',
+            'YJS_REDIS_PREFIX'
         ];
 
         const missingEnvVars = requiredEnvVars.filter(varName => !process.env[varName]);
@@ -172,8 +203,7 @@ class Server {
         this.app.get('/health', noCacheResponse(), appController.getHealth);
         
         // Import auth middleware for CSRF protection
-        const authMiddlewareModule = await import('./middleware/auth.middleware.js');
-        const { csrfProtection, attachCsrfToken } = authMiddlewareModule;
+        const {csrfProtection, attachCsrfToken} = await import('./middleware/auth.middleware.js');
         
         // Apply CSRF token attachment to all API routes (sets cookie if missing)
         this.app.use('/api', attachCsrfToken);
@@ -184,38 +214,29 @@ class Server {
         
         // Import route modules (lazy load to avoid circular dependencies)
         const [
-            authRoutesModule,
-            userRoutesModule,
-            appRoutesModule,
-            fileRoutesModule,
-            cacheRoutesModule
+            {default: authRouter},
+            {default: userRouter},
+            {default: appRouter},
+            {default: fileRouter},
+            {default: cacheRouter},
+            {default: integrationRouter}
         ] = await Promise.all([
             import('./routes/auth.routes.js'),
             import('./routes/user.routes.js'),
             import('./routes/app.routes.js'),
             import('./routes/file.routes.js'),
-            import('./routes/cache.routes.js')
+            import('./routes/cache.routes.js'),
+            import('./routes/integration.routes.js')
         ]);
-
-        const authRouter = authRoutesModule.default ?? authRoutesModule.router ?? authRoutesModule;
-        const userRouter = userRoutesModule.default ?? userRoutesModule.router ?? userRoutesModule;
-        const appRouter = appRoutesModule.default ?? appRoutesModule.router ?? appRoutesModule;
-        const fileRouter = fileRoutesModule.default ?? fileRoutesModule.router ?? fileRoutesModule;
-        const cacheRouter = cacheRoutesModule.default ?? cacheRoutesModule.router ?? cacheRoutesModule;
-
-        const authValidRoutes = authRoutesModule.validRoutes ?? authRouter.validRoutes ?? [];
-        const userValidRoutes = userRoutesModule.validRoutes ?? userRouter.validRoutes ?? [];
-        const appValidRoutes = appRoutesModule.validRoutes ?? appRouter.validRoutes ?? [];
-        const fileValidRoutes = fileRoutesModule.validRoutes ?? fileRouter.validRoutes ?? [];
-        const cacheValidRoutes = cacheRoutesModule.validRoutes ?? cacheRouter.validRoutes ?? [];
 
         appMiddleware.registerRoutes([
             '/health',
-            ...appValidRoutes,
-            ...authValidRoutes,
-            ...userValidRoutes,
-            ...fileValidRoutes,
-            ...cacheValidRoutes
+            ...appRouter.validRoutes,
+            ...authRouter.validRoutes,
+            ...userRouter.validRoutes,
+            ...fileRouter.validRoutes,
+            ...cacheRouter.validRoutes,
+            ...integrationRouter.validRoutes
         ]);
 
         // Apply route validation middleware specifically to /api routes
@@ -226,6 +247,7 @@ class Server {
         this.app.use('/api/v1/users', userRouter);
         this.app.use('/api/v1/files', fileRouter);
         this.app.use('/api/v1/cache', cacheRouter);
+        this.app.use('/api/v1/integrations', integrationRouter);
         this.app.use('/api/v1', appRouter);
 
         // Handle undefined routes
@@ -355,7 +377,7 @@ class Server {
             return new Promise((resolve) => {
                 this.server = this.httpServer.listen(serverPort, async () => {
                     // Start cache cleanup service if caching is enabled and cleanup is enabled
-                    if (this.config.cacheEnabled && process.env.CACHE_CLEANUP_ENABLED !== 'false') {
+                    if (this.config.cacheEnabled && process.env.CACHE_CLEANUP_ENABLED === 'true') {
                         try {
                             // Use hours instead of minutes, with conservative default
                             const cleanupIntervalHours = parseInt(process.env.CACHE_CLEANUP_INTERVAL_HOURS);
@@ -377,9 +399,8 @@ class Server {
                         
                         const fileControllerModule = await import('./controllers/file.controller.js');
                         const authMiddleware = await import('./middleware/auth.middleware.js');
-                        const fileModelModule = await import('./models/file.model.js');
-                        const FileModel = fileModelModule.default ?? fileModelModule.File ?? fileModelModule;
-                        const yjsService = fileControllerModule.yjsService ?? fileControllerModule.getYjsService?.();
+                        const {default: FileModel} = await import('./models/file.model.js');
+                        const {yjsService} = fileControllerModule;
 
                         // Create WebSocket server using the existing HTTP server - standard Yjs pattern
                         // Handle both /yjs/ and /notifications paths appropriately
@@ -578,7 +599,6 @@ class Server {
         }
     }
     
-
 
     /**
      * Stop the server and close connections

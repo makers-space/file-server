@@ -1,4 +1,6 @@
 import logger from '../utils/app.logger.js';
+import Theme from '../models/theme.model.js';
+import {hasRight, RIGHTS} from '../config/rights.js';
 import Log from '../models/log.model.js';
 import mongoose from 'mongoose';
 import {cache} from '../middleware/cache.middleware.js';
@@ -64,10 +66,9 @@ const getHealthStatus = async () => {
     // Check Yjs Redis pub/sub health
     let yjsRedisHealth = { status: 'not_available' };
     try {
-    const fileControllerModule = await import('./file.controller.js');
-    const fileController = fileControllerModule.default ?? fileControllerModule;
-        if (fileController.yjsService && fileController.yjsService.isInitialized) {
-            yjsRedisHealth = await fileController.yjsService.redisHealthCheck();
+        const {yjsService} = await import('./file.controller.js');
+        if (yjsService && yjsService.isInitialized) {
+            yjsRedisHealth = await yjsService.redisHealthCheck();
         }
     } catch (error) {
         yjsRedisHealth = { status: 'error', message: error.message };
@@ -1547,7 +1548,7 @@ const clearTemplateCache = () => {
 const initializeEmailService = async () => {
     try {
         // Check if email is enabled via environment variables
-        if (!process.env.EMAIL_ENABLED || process.env.EMAIL_ENABLED === 'false') {
+        if (process.env.EMAIL_ENABLED !== 'true') {
             logger.warn('Email service is disabled via EMAIL_ENABLED environment variable');
             return null;
         }
@@ -1722,8 +1723,7 @@ const getGridFSStorageStats = async () => {
         if (collectionNames.includes('files')) {
             logger.info('Found regular files collection, counting documents...');
             try {
-                const fileModelModule = await import('../models/file.model.js');
-                const File = fileModelModule.default ?? fileModelModule.File ?? fileModelModule;
+                const {default: File} = await import('../models/file.model.js');
 
                 // Get detailed breakdown of regular files
                 const regularFiles = await File.aggregate([
@@ -1984,16 +1984,6 @@ const parseFilters = (query) => {
             filters.method = {$in: methods};
         } else {
             filters.method = query.method.toUpperCase();
-        }
-    }
-
-    // Status code filters (replacing level filters)
-    if (query.statusCode) {
-        if (query.statusCode.includes(',')) {
-            const codes = query.statusCode.split(',').map(c => parseInt(c.trim()));
-            filters.statusCode = {$in: codes};
-        } else {
-            filters.statusCode = parseInt(query.statusCode);
         }
     }
 
@@ -2357,8 +2347,8 @@ const getApplicationOverviewStats = asyncHandler(async (req, res, next) => {
     try {
     const userModelModule = await import('../models/user.model.js');
     const fileModelModule = await import('../models/file.model.js');
-    const User = userModelModule.default ?? userModelModule.User ?? userModelModule;
-    const File = fileModelModule.default ?? fileModelModule.File ?? fileModelModule;
+    const User = userModelModule.default;
+    const File = fileModelModule.default;
 
         // Initialize stats object
         const stats = {
@@ -2743,7 +2733,268 @@ const submitContactForm = asyncHandler(async (req, res, next) => {
     });
 });
 
+/* ============================================================================
+ * Themes — CRUD + gallery for dynamic, user-created themes
+ * ========================================================================= */
+
+/** Escape user input before embedding it in a RegExp */
+const escapeRegex = (value = '') => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+const canManageAll = (user) => hasRight(user?.roles, RIGHTS.MANAGE_ALL_CONTENT);
+
+const isOwnerOfTheme = (user, theme) =>
+    theme.owner && user && theme.owner.toString() === user.id.toString();
+
+/**
+ * @desc    List built-in preset themes (the seeded App Base six)
+ * @route   GET /api/v1/themes/presets
+ * @access  Public
+ */
+const getPresets = asyncHandler(async (req, res) => {
+    const presets = await Theme.find({isPreset: true}).sort({name: 1});
+    res.status(200).json({
+        success: true,
+        message: 'Preset themes retrieved successfully',
+        themes: presets.map((theme) => theme.toPublicJSON())
+    });
+});
+
+/**
+ * @desc    List public (community-published) themes
+ * @route   GET /api/v1/themes/public
+ * @access  Public
+ */
+const getPublicThemes = asyncHandler(async (req, res) => {
+    const {page = 1, limit = 20, search, sortBy = 'appliedCount', sortOrder = 'desc'} = req.query;
+
+    const query = {visibility: 'public', isPreset: false};
+    if (search) {
+        query.$or = [
+            {name: {$regex: escapeRegex(search), $options: 'i'}},
+            {description: {$regex: escapeRegex(search), $options: 'i'}}
+        ];
+    }
+
+    const numericLimit = Math.min(parseInt(limit, 10) || 20, 100);
+    const numericPage = Math.max(parseInt(page, 10) || 1, 1);
+
+    const [themes, total] = await Promise.all([
+        Theme.find(query)
+            .sort({[sortBy]: sortOrder === 'asc' ? 1 : -1})
+            .skip((numericPage - 1) * numericLimit)
+            .limit(numericLimit),
+        Theme.countDocuments(query)
+    ]);
+
+    res.status(200).json({
+        success: true,
+        message: 'Public themes retrieved successfully',
+        themes: themes.map((theme) => theme.toPublicJSON()),
+        pagination: {
+            page: numericPage,
+            limit: numericLimit,
+            total,
+            pages: Math.ceil(total / numericLimit)
+        }
+    });
+});
+
+/**
+ * @desc    List the authenticated user's own themes
+ * @route   GET /api/v1/themes
+ * @access  Authenticated
+ */
+const getMyThemes = asyncHandler(async (req, res) => {
+    const themes = await Theme.find({owner: req.user.id}).sort({updatedAt: -1});
+    res.status(200).json({
+        success: true,
+        message: 'Themes retrieved successfully',
+        themes
+    });
+});
+
+/**
+ * @desc    Get a single theme (owner, or public/unlisted for everyone)
+ * @route   GET /api/v1/themes/:id
+ * @access  Authenticated (presets/public/unlisted readable by any authenticated user)
+ */
+const getThemeById = asyncHandler(async (req, res, next) => {
+    const theme = await Theme.findById(req.params.id);
+    if (!theme) {
+        return next(new AppError('Theme not found', 404));
+    }
+
+    const readable = theme.isPreset
+        || theme.visibility !== 'private'
+        || isOwnerOfTheme(req.user, theme)
+        || canManageAll(req.user);
+
+    if (!readable) {
+        return next(new AppError('You do not have permission to view this theme', 403));
+    }
+
+    const payload = isOwnerOfTheme(req.user, theme) || canManageAll(req.user)
+        ? theme
+        : theme.toPublicJSON();
+
+    res.status(200).json({
+        success: true,
+        message: 'Theme retrieved successfully',
+        theme: payload
+    });
+});
+
+/**
+ * @desc    Create a theme
+ * @route   POST /api/v1/themes
+ * @access  Authenticated (CREATE_CONTENT)
+ */
+const createTheme = asyncHandler(async (req, res, next) => {
+    const {name, slug, description = '', visibility = 'private', tokens, forkedFrom} = req.body;
+
+    const existing = await Theme.findOne({owner: req.user.id, slug});
+    if (existing) {
+        return next(new AppError(`You already have a theme with slug "${slug}"`, 409));
+    }
+
+    if (forkedFrom) {
+        const source = await Theme.findById(forkedFrom);
+        const forkable = source && (source.isPreset || source.visibility !== 'private'
+            || isOwnerOfTheme(req.user, source));
+        if (!forkable) {
+            return next(new AppError('Source theme not found or not forkable', 404));
+        }
+    }
+
+    const theme = await Theme.create({
+        name, slug, description, visibility, tokens,
+        forkedFrom: forkedFrom || null,
+        owner: req.user.id,
+        isPreset: false
+    });
+
+    logger.info(`🎨 Theme created: ${theme.slug} by ${req.user.username}`);
+    res.status(201).json({
+        success: true,
+        message: 'Theme created successfully',
+        theme
+    });
+});
+
+/**
+ * @desc    Update a theme (owner or content managers; presets are locked)
+ * @route   PUT /api/v1/themes/:id
+ * @access  Authenticated (owner | MANAGE_ALL_CONTENT)
+ */
+const updateTheme = asyncHandler(async (req, res, next) => {
+    const theme = await Theme.findById(req.params.id);
+    if (!theme) {
+        return next(new AppError('Theme not found', 404));
+    }
+    if (theme.isPreset) {
+        return next(new AppError('Preset themes cannot be modified — fork them instead', 403));
+    }
+    if (!isOwnerOfTheme(req.user, theme) && !canManageAll(req.user)) {
+        return next(new AppError('You do not have permission to modify this theme', 403));
+    }
+
+    const updatableFields = ['name', 'slug', 'description', 'visibility', 'tokens'];
+    updatableFields.forEach((field) => {
+        if (req.body[field] !== undefined) {
+            theme[field] = req.body[field];
+        }
+    });
+
+    await theme.save();
+
+    logger.info(`🎨 Theme updated: ${theme.slug}`);
+    res.status(200).json({
+        success: true,
+        message: 'Theme updated successfully',
+        theme
+    });
+});
+
+/**
+ * @desc    Delete a theme (owner or content managers; presets are locked)
+ * @route   DELETE /api/v1/themes/:id
+ * @access  Authenticated (owner | MANAGE_ALL_CONTENT)
+ */
+const deleteTheme = asyncHandler(async (req, res, next) => {
+    const theme = await Theme.findById(req.params.id);
+    if (!theme) {
+        return next(new AppError('Theme not found', 404));
+    }
+    if (theme.isPreset) {
+        return next(new AppError('Preset themes cannot be deleted', 403));
+    }
+    if (!isOwnerOfTheme(req.user, theme) && !canManageAll(req.user)) {
+        return next(new AppError('You do not have permission to delete this theme', 403));
+    }
+
+    await theme.deleteOne();
+
+    logger.info(`🗑️ Theme deleted: ${theme.slug}`);
+    res.status(200).json({
+        success: true,
+        message: 'Theme deleted successfully'
+    });
+});
+
+/**
+ * @desc    Fork a theme into the caller's account
+ * @route   POST /api/v1/themes/:id/fork
+ * @access  Authenticated (CREATE_CONTENT)
+ */
+const forkTheme = asyncHandler(async (req, res, next) => {
+    const source = await Theme.findById(req.params.id);
+    if (!source) {
+        return next(new AppError('Theme not found', 404));
+    }
+
+    const forkable = source.isPreset || source.visibility !== 'private'
+        || isOwnerOfTheme(req.user, source) || canManageAll(req.user);
+    if (!forkable) {
+        return next(new AppError('You do not have permission to fork this theme', 403));
+    }
+
+    // Derive a unique slug for the fork within the caller's namespace
+    let slug = source.slug;
+    let attempt = 1;
+    // Bounded loop: extremely unlikely to pass a handful of collisions
+    while (await Theme.findOne({owner: req.user.id, slug}) && attempt < 50) {
+        slug = `${source.slug}-fork${attempt > 1 ? `-${attempt}` : ''}`;
+        attempt += 1;
+    }
+
+    const fork = await Theme.create({
+        name: `${source.name} (fork)`.slice(0, 50),
+        slug,
+        description: source.description,
+        visibility: 'private',
+        tokens: source.tokens,
+        forkedFrom: source._id,
+        owner: req.user.id,
+        isPreset: false
+    });
+
+    logger.info(`🎨 Theme forked: ${source.slug} → ${fork.slug} by ${req.user.username}`);
+    res.status(201).json({
+        success: true,
+        message: 'Theme forked successfully',
+        theme: fork
+    });
+});
+
 export {
+    getPresets,
+    getPublicThemes,
+    getMyThemes,
+    getThemeById,
+    createTheme,
+    updateTheme,
+    deleteTheme,
+    forkTheme,
     getHealth,
     getApiHealth,
     setupHealthRoutes,

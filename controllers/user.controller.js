@@ -499,7 +499,7 @@ const userController = {
                 updatedUser = await User.findByIdAndUpdate(
                     req.params.id,
                     {$set: sanitizedUpdates},
-                    {new: true, runValidators: true}
+                    {returnDocument: 'after', runValidators: true}
                 ).select('+active'); // Include the active field in the response
             } catch (updateError) {
                 logger.error(`Error updating user ${req.params.id}:`, {
@@ -1034,24 +1034,6 @@ const userController = {
                     twoFactorEnabled: !!user.twoFactorEnabled,
                     active: !!user.active
                 };
-            } else {
-                // Limited view for non-admins viewing other users
-                stats.limited = true;
-                delete stats.security;
-                delete stats.activity;
-
-                // Only include basic file stats
-                try {
-                    const userObjectId = new mongoose.Types.ObjectId(userId);
-                    stats.files = {
-                        totalFiles: await File.countDocuments({
-                            owner: userObjectId,
-                            isPublic: true // Only show count of public files
-                        })
-                    };
-                } catch (err) {
-                    stats.files = {error: 'File statistics not available'};
-                }
             }
 
             logger.info(`User stats retrieved for user: ${userId}`, {
@@ -1985,7 +1967,8 @@ const userController = {
                     [{$set: {
                         filePath:   {$replaceAll: {input: '$filePath',   find: oldPath, replacement: newPath}},
                         parentPath: {$replaceAll: {input: '$parentPath', find: oldPath, replacement: newPath}}
-                    }}]
+                    }}],
+                    {updatePipeline: true}
                 );
                 group.rootFolderPath = newPath;
             }

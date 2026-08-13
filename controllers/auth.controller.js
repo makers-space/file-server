@@ -243,7 +243,7 @@ const sendNewDeviceLoginEmail = async (user, deviceInfo, transporter = null) => 
             device: deviceInfo.platform || 'Unknown',
             browser: deviceInfo.browser ? `${deviceInfo.browser} on ${deviceInfo.os || 'Unknown OS'}` : null,
             appUrl: process.env.APP_URL,
-            appName: process.env.APP_NAME || 'Filesystem One'
+            appName: process.env.APP_NAME
         }
     }, transporter);
 };
@@ -305,7 +305,7 @@ const authController = {
             }
 
             // Hash the password (password validation already done by middleware)
-            const hashedPassword = await bcrypt.hash(password, 12);
+            const hashedPassword = await bcrypt.hash(password, parseInt(process.env.BCRYPT_ROUNDS));
 
             // Process roles with approval logic
             const roleProcessing = processRolesWithApproval(
@@ -935,7 +935,7 @@ const authController = {
             user.addPasswordToHistory(user.password);
 
             // Set new password and clear reset token fields
-            user.password = await bcrypt.hash(password, 12);
+            user.password = await bcrypt.hash(password, parseInt(process.env.BCRYPT_ROUNDS));
             user.passwordResetToken = undefined;
             user.passwordResetExpires = undefined;
             user.passwordChangedAt = Date.now();

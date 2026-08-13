@@ -3151,9 +3151,9 @@ const fileController = {
                     totalOriginalSize: compressionSummary.totalOriginalSize,
                     byAlgorithm: compressionData.byAlgorithm,
                     systemConfig: {
-                        defaultAlgorithm: process.env.COMPRESSION_ALGORITHM || 'gzip',
-                        compressionLevel: parseInt(process.env.COMPRESSION_LEVEL) || 6,
-                        autoCompress: process.env.AUTO_COMPRESS !== 'false'
+                        defaultAlgorithm: process.env.COMPRESSION_ALGORITHM,
+                        compressionLevel: parseInt(process.env.COMPRESSION_LEVEL),
+                        autoCompress: process.env.AUTO_COMPRESS === 'true'
                     }
                 },
                 recentActivity: {

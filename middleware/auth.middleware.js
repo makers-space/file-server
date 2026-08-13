@@ -81,7 +81,7 @@ const TOKEN_COOKIE_OPTIONS = {
 };
 
 // Token lifetimes from env – single source of truth for TTL defaults below.
-const REFRESH_TOKEN_EXPIRY_S = parseExpiryToSeconds(process.env.REFRESH_TOKEN_EXPIRY || '7d');
+const REFRESH_TOKEN_EXPIRY_S = parseExpiryToSeconds(process.env.REFRESH_TOKEN_EXPIRY);
 
 /**
  * Generate a unique token family ID for refresh token chains

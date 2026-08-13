@@ -260,7 +260,7 @@ fileSchema.virtual('fileExtension').get(function () {
 });
 
 // Pre-save middleware to set defaults and validate
-fileSchema.pre('save', async function(next) {
+fileSchema.pre('save', async function() {
     // Auto-calculate parentPath and fileName when filePath exists or changes
     if (this.filePath && (this.isNew || this.isModified('filePath'))) {
         // Calculate parentPath
@@ -293,8 +293,6 @@ fileSchema.pre('save', async function(next) {
             contentEncoding: null
         };
     }
-    
-    next();
 });
 
 // Static method to validate file paths
@@ -1040,6 +1038,6 @@ fileSchema.statics.isTextBasedFile = function(mimeType) {
 };
 
 // Check if model already exists to prevent recompilation errors
-const File = mongoose.models.File || mongoose.model('File', fileSchema);
+const File = mongoose.model('File', fileSchema);
 
 export default File;

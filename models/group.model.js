@@ -88,9 +88,8 @@ groupSchema.index({privacy: 1, name: 1});
 groupSchema.index({rootFolderPath: 1}); // used by findGroupForFilePath ancestor lookup
 
 // Keep cached counts in sync
-groupSchema.pre('save', function (next) {
+groupSchema.pre('save', function () {
     this.memberCount = this.members.length;
-    next();
 });
 
 /**
@@ -117,6 +116,6 @@ groupSchema.methods.hasMinRole = function (userId, minRole) {
     return GROUP_ROLE_HIERARCHY[memberRole] >= GROUP_ROLE_HIERARCHY[minRole];
 };
 
-const Group = mongoose.models.Group || mongoose.model('Group', groupSchema);
+const Group = mongoose.model('Group', groupSchema);
 
 export default Group;

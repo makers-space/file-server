@@ -12,7 +12,7 @@ const getRedisClient = () => redisClient;
 
 // Check if caching is enabled via environment variable
 const isCacheEnabled = () => {
-    return process.env.CACHE_ENABLED !== 'false';
+    return process.env.CACHE_ENABLED === 'true';
 };
 
 // Core cache operations

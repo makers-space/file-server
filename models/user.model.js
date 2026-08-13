@@ -128,13 +128,12 @@ const userSchema = new mongoose.Schema({
     toJSON: {virtuals: false}, toObject: {virtuals: false}
 });
 
-userSchema.pre('save', function (next) {
+userSchema.pre('save', function () {
     // Update `passwordChangedAt` when the password is modified
     if (!this.isModified('password') || this.isNew) {
-        return next();
+        return;
     }
     this.passwordChangedAt = Date.now() - 1000; // Subtract 1 second to account for token issuance delay
-    next();
 });
 
 userSchema.methods.correctPassword = async function (candidatePassword, userPassword) {
@@ -207,8 +206,7 @@ userSchema.methods.addPasswordToHistory = function (hashedPassword) {
     }
 };
 
-// Check if model exists to prevent recompilation errors in tests
-const User = mongoose.models.User || mongoose.model('User', userSchema);
+const User = mongoose.model('User', userSchema);
 
 // =========================================================================
 // CONNECTION SCHEMA (LinkedIn-style symmetric connections)
@@ -241,14 +239,13 @@ connectionSchema.index({requester: 1, recipient: 1}, {unique: true});
 connectionSchema.index({recipient: 1, status: 1});
 connectionSchema.index({requester: 1, status: 1});
 
-connectionSchema.pre('validate', function (next) {
+connectionSchema.pre('validate', function () {
     if (this.requester.equals(this.recipient)) {
-        return next(new Error('Users cannot connect with themselves'));
+        throw new Error('Users cannot connect with themselves');
     }
-    next();
 });
 
-const Connection = mongoose.models.Connection || mongoose.model('Connection', connectionSchema);
+const Connection = mongoose.model('Connection', connectionSchema);
 
 export default User;
 export {Connection};

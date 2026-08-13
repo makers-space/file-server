@@ -675,6 +675,72 @@ export const fileParamSchemas = {
     })
 };
 
+// External integration schemas (external file sharing via verified APIs)
+export const integrationSchemas = {
+    createIntegration: Joi.object({
+        name: Joi.string().min(2).max(100).required()
+            .messages({
+                'string.min': 'Integration name must be at least 2 characters',
+                'string.max': 'Integration name must be less than 100 characters',
+                'any.required': 'Integration name is required'
+            }),
+        description: Joi.string().max(500).allow('').default(''),
+        baseUrl: Joi.string().uri({scheme: ['https', 'http']}).max(2048).required()
+            .messages({
+                'string.uri': 'Integration URL must be a valid HTTP(S) URL',
+                'any.required': 'Integration URL is required'
+            }),
+        apiKey: Joi.string().max(500).allow(null, ''),
+        apiKeyHeader: Joi.string().pattern(/^[A-Za-z0-9-]+$/).max(100).default('X-Api-Key')
+            .messages({
+                'string.pattern.base': 'API key header may only contain letters, numbers and hyphens'
+            }),
+        scope: Joi.string().valid('global', 'user').default('user')
+            .messages({
+                'any.only': 'Scope must be either "global" or "user"'
+            })
+    }),
+
+    updateIntegration: Joi.object({
+        name: Joi.string().min(2).max(100),
+        description: Joi.string().max(500).allow(''),
+        baseUrl: Joi.string().uri({scheme: ['https', 'http']}).max(2048)
+            .messages({
+                'string.uri': 'Integration URL must be a valid HTTP(S) URL'
+            }),
+        apiKey: Joi.string().max(500).allow(null, ''),
+        apiKeyHeader: Joi.string().pattern(/^[A-Za-z0-9-]+$/).max(100),
+        status: Joi.string().valid('disabled')
+            .messages({
+                'any.only': 'Status may only be set to "disabled" — verification is done via the verify endpoint'
+            })
+    }).min(1)
+        .messages({
+            'object.min': 'At least one field must be provided'
+        }),
+
+    sendFile: Joi.object({
+        filePath: Joi.filePath().required()
+            .messages({
+                'any.required': 'File path is required'
+            }),
+        includeContent: Joi.boolean().default(false),
+        event: Joi.string().pattern(/^[a-z0-9._-]+$/i).max(100).default('file.export')
+            .messages({
+                'string.pattern.base': 'Event may only contain letters, numbers, dots, hyphens and underscores'
+            })
+    })
+};
+
+export const integrationParamSchemas = {
+    integrationId: Joi.object({
+        integrationId: Joi.objectId().required()
+            .messages({
+                'any.required': 'Integration ID parameter is required'
+            })
+    })
+};
+
 // Two-Factor Authentication Schemas
 export const twoFactorSchemas = {
     verifySetup: Joi.object({
@@ -838,5 +904,96 @@ export const commentSchemas = {
                 'string.max': 'Comment cannot exceed 2000 characters',
                 'any.required': 'Comment body is required'
             })
+    })
+};
+
+const hexColor = () => Joi.string().pattern(/^#([0-9a-fA-F]{3,4}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$/)
+    .messages({'string.pattern.base': '{#label} must be a hex color (e.g. #3F84E5)'});
+
+const cssLength = () => Joi.string().max(20).pattern(/^([0-9.]+(px|rem|em|%)|9999px|50%|none|0)$/)
+    .messages({'string.pattern.base': '{#label} must be a CSS length (e.g. 0.5rem, 8px, 50%)'});
+
+const fontKey = () => Joi.string().max(50).pattern(/^[a-z0-9-]+$/)
+    .messages({'string.pattern.base': '{#label} must be a font registry key (lowercase, hyphens)'});
+
+const themeColorsSchema = Joi.object({
+    primary: hexColor().required(),
+    primaryAccent: hexColor().required(),
+    secondary: hexColor().required(),
+    secondaryAccent: hexColor().required(),
+    tertiary: hexColor(),
+    tertiaryAccent: hexColor(),
+    neutral: hexColor(),
+    neutralAccent: hexColor(),
+    success: hexColor(),
+    warning: hexColor(),
+    error: hexColor(),
+    background: hexColor().required(),
+    surface: hexColor().required(),
+    surfaceAccent: hexColor(),
+    border: hexColor(),
+    text: hexColor().required(),
+    textContrast: hexColor().required(),
+    shadow: Joi.string().max(60)
+});
+
+const themeTokensSchema = Joi.object({
+    darkMode: Joi.boolean().default(false),
+    colors: themeColorsSchema.required(),
+    fonts: Joi.object({
+        primary: fontKey(),
+        secondary: fontKey(),
+        monospace: fontKey()
+    }),
+    radii: Joi.object({
+        base: cssLength(),
+        card: cssLength(),
+        input: cssLength(),
+        button: cssLength(),
+        checkbox: cssLength(),
+        fab: cssLength(),
+        progress: cssLength(),
+        notification: cssLength()
+    })
+});
+
+export const themeSchemas = {
+    themeId: Joi.object({
+        id: Joi.objectId().required()
+    }),
+
+    createTheme: Joi.object({
+        name: Joi.string().min(2).max(50).required()
+            .messages({
+                'string.min': 'Theme name must be at least 2 characters',
+                'string.max': 'Theme name cannot exceed 50 characters',
+                'any.required': 'Theme name is required'
+            }),
+        slug: Joi.string().min(2).max(50).pattern(/^[a-z0-9-]+$/).required()
+            .messages({
+                'string.pattern.base': 'Slug can only contain lowercase letters, numbers, and hyphens',
+                'any.required': 'Slug is required'
+            }),
+        description: Joi.string().allow('').max(300),
+        visibility: Joi.string().valid('private', 'unlisted', 'public').default('private'),
+        forkedFrom: Joi.objectId(),
+        tokens: themeTokensSchema.required()
+            .messages({'any.required': 'Theme tokens are required'})
+    }),
+
+    updateTheme: Joi.object({
+        name: Joi.string().min(2).max(50),
+        slug: Joi.string().min(2).max(50).pattern(/^[a-z0-9-]+$/),
+        description: Joi.string().allow('').max(300),
+        visibility: Joi.string().valid('private', 'unlisted', 'public'),
+        tokens: themeTokensSchema
+    }).min(1),
+
+    listThemes: Joi.object({
+        page: Joi.number().integer().min(1).default(1),
+        limit: Joi.number().integer().min(1).max(100).default(20),
+        search: Joi.string().max(100),
+        sortBy: Joi.string().valid('name', 'createdAt', 'updatedAt', 'appliedCount').default('updatedAt'),
+        sortOrder: Joi.string().valid('asc', 'desc').default('desc')
     })
 };

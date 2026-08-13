@@ -65,8 +65,8 @@ const brotliDecompress = promisify(zlib.brotliDecompress);
 
 const COMPRESSION_CONFIG = {
     // Minimum file size to consider compression (1KB)
-    minSizeForCompression: parseInt(process.env.COMPRESSION_MIN_SIZE) || 1024,
-    minCompressionRatio: parseFloat(process.env.COMPRESSION_MIN_RATIO) || 0.05,
+    minSizeForCompression: parseInt(process.env.COMPRESSION_MIN_SIZE),
+    minCompressionRatio: parseFloat(process.env.COMPRESSION_MIN_RATIO),
 
     // Compression algorithms and their priorities
     algorithms: {
@@ -386,6 +386,17 @@ const handleFileErrors = (err, req, res, next) => {
         });
     }
 
+    // The fileFilter rejects blocked extensions with a plain Error, not a
+    // MulterError. That is a rejected request, not a server fault.
+    if (err.message && err.message.includes('is not allowed for security reasons')) {
+        logger.warn('Blocked file upload rejected', {message: err.message});
+        return res.status(400).json({
+            success: false,
+            message: err.message,
+            code: 'BLOCKED_FILE_TYPE'
+        });
+    }
+
     // Handle compression/decompression errors
     if (err.message && err.message.includes('decompress')) {
         logger.error('File decompression error:', err);
@@ -471,7 +482,7 @@ const docNameFromUrlPath = (reqUrl) => {
  * Map, cancelFn registry, dual 500ms/3000ms debouncers, and inline
  * compaction race.
  */
-const YJS_FLUSH_DELAY_MS = parseInt(process.env.YJS_FLUSH_DELAY_MS, 10) || 500;
+const YJS_FLUSH_DELAY_MS = parseInt(process.env.YJS_FLUSH_DELAY_MS, 10);
 
 const makeDocState = () => ({
     epoch: 0,                  // bumped on replaceContent — old batches are discarded
