@@ -82,7 +82,7 @@ router.get('/me',
     async (req, res) => {
         // Fetch live roleApprovalStatus and pendingRoles from DB (not in JWT)
         const User = (await import('../models/user.model.js')).default;
-        const dbUser = await User.findById(req.user.id).select('roleApprovalStatus pendingRoles roleApprovalRequest').lean();
+        const dbUser = await User.findById(req.user.id).select('roleApprovalStatus pendingRoles roleApprovalRequest bio').lean();
         res.status(200).json({
             success: true,
             message: 'User profile retrieved successfully',
@@ -90,6 +90,7 @@ router.get('/me',
                 id: req.user.id,
                 firstName: req.user.firstName,
                 lastName: req.user.lastName,
+                bio: dbUser?.bio || '',
                 username: req.user.username,
                 email: req.user.email,
                 roles: req.user.roles,

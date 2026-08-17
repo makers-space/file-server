@@ -120,6 +120,31 @@ const integrationSchema = new mongoose.Schema({
         totalDeliveries: {type: Number, default: 0},
         failedDeliveries: {type: Number, default: 0},
         lastDeliveryAt: {type: Date, default: null}
+    },
+    // Inbound access — lets the external app pull granted files from us,
+    // authenticated with a hashed API key (issued/revealed exactly once)
+    inboundKeyHash: {
+        type: String,
+        default: null,
+        select: false,
+        index: true
+    },
+    inboundKeyIssuedAt: {
+        type: Date,
+        default: null
+    },
+    // Read-only path prefixes the external app may fetch
+    grants: {
+        type: [new mongoose.Schema({
+            path: {type: String, required: true, trim: true, maxlength: 1024},
+            access: {type: String, enum: ['read'], default: 'read'}
+        }, {_id: false})],
+        default: []
+    },
+    inboundStats: {
+        totalRequests: {type: Number, default: 0},
+        deniedRequests: {type: Number, default: 0},
+        lastRequestAt: {type: Date, default: null}
     }
 }, {
     timestamps: true,
@@ -130,6 +155,7 @@ const integrationSchema = new mongoose.Schema({
             delete ret._id;
             delete ret.apiKey;
             delete ret.signingSecret;
+            delete ret.inboundKeyHash;
             delete ret.__v;
             return ret;
         }
@@ -144,6 +170,29 @@ integrationSchema.index({owner: 1, name: 1});
  */
 integrationSchema.statics.generateSigningSecret = function () {
     return crypto.randomBytes(32).toString('hex');
+};
+
+/**
+ * Generate a fresh inbound API key (returned in plain form exactly once)
+ */
+integrationSchema.statics.generateInboundKey = function () {
+    return `fso_${crypto.randomBytes(24).toString('hex')}`;
+};
+
+/** Deterministic hash for inbound key storage/lookup */
+integrationSchema.statics.hashInboundKey = function (key) {
+    return crypto.createHash('sha256').update(key).digest('hex');
+};
+
+/**
+ * Whether the given normalized file path falls inside any read grant
+ */
+integrationSchema.methods.grantsPath = function (filePath) {
+    return (this.grants || []).some(({path}) => {
+        if (path === '/') return true;
+        const prefix = path.endsWith('/') ? path.slice(0, -1) : path;
+        return filePath === prefix || filePath.startsWith(`${prefix}/`);
+    });
 };
 
 /**

@@ -267,11 +267,14 @@ class Server {
     async connectDatabase() {
         try {
             this.dbConnection = await connectDB();
-            
+
             // Initialize Yjs service after database connection
             const yjsService = getYjsService();
             await yjsService.initialize();
-            
+
+            const {seedPresetThemes} = await import('./config/preset.themes.js');
+            await seedPresetThemes();
+
             return this.dbConnection;
         } catch (error) {
             logger.error('Failed to connect to database:', error);

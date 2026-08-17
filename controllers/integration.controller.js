@@ -14,6 +14,7 @@
 
 import Integration, {INTEGRATION_SCOPES, INTEGRATION_STATUSES} from '../models/integration.model.js';
 import File from '../models/file.model.js';
+import User from '../models/user.model.js';
 import {asyncHandler} from '../middleware/app.middleware.js';
 import {AppError} from '../middleware/error.middleware.js';
 import {hasRight, RIGHTS} from '../config/rights.js';
@@ -22,7 +23,8 @@ import {
     validateExternalUrl,
     deliverPayload,
     sendVerificationChallenge,
-    contentChecksum
+    contentChecksum,
+    signPayload
 } from '../utils/external.delivery.js';
 import {getYjsService} from '../middleware/file.middleware.js';
 import mongoose from 'mongoose';
@@ -429,6 +431,174 @@ const integrationController = {
             stats: integration.stats,
             deliveries: integration.deliveryLog
         });
+    }),
+
+    /**
+     * @desc    Issue (or rotate) the inbound API key the external app uses to
+     *          pull granted files. Returned in plain form exactly once.
+     * @route   POST /api/v1/integrations/:integrationId/inbound-key
+     * @access  Private (owner or admin)
+     */
+    issueInboundKey: asyncHandler(async (req, res) => {
+        const integration = await loadIntegration(req.params.integrationId);
+        assertCanManage(req, integration);
+
+        const inboundKey = Integration.generateInboundKey();
+        integration.inboundKeyHash = Integration.hashInboundKey(inboundKey);
+        integration.inboundKeyIssuedAt = new Date();
+        await integration.save();
+
+        logger.info(`🔑 Inbound key issued for integration ${integration.name} (${integration.id})`);
+        res.status(200).json({
+            success: true,
+            message: 'Inbound API key issued — copy it now, it will not be shown again',
+            inboundKey,
+            integration
+        });
+    }),
+
+    /**
+     * @desc    Replace the read grants (path prefixes the external app may fetch)
+     * @route   PUT /api/v1/integrations/:integrationId/grants
+     * @access  Private (owner or admin)
+     */
+    setGrants: asyncHandler(async (req, res) => {
+        const integration = await loadIntegration(req.params.integrationId);
+        assertCanManage(req, integration);
+
+        const grants = (req.body.grants || []).map(({path}) => {
+            let normalized = String(path || '').trim();
+            if (!normalized.startsWith('/')) {
+                throw new AppError(`Grant paths must be absolute (got "${path}")`, 400);
+            }
+            if (normalized.length > 1 && normalized.endsWith('/')) {
+                normalized = normalized.slice(0, -1);
+            }
+            return {path: normalized, access: 'read'};
+        });
+
+        integration.grants = grants;
+        await integration.save();
+
+        res.status(200).json({
+            success: true,
+            message: 'Grants updated',
+            integration
+        });
+    }),
+
+    /**
+     * @desc    Authenticate an external app by inbound API key (X-FSOne-Key)
+     * @route   middleware for /api/v1/integrations/external/*
+     * @access  External (no session)
+     */
+    verifyIntegrationKey: asyncHandler(async (req, _res, next) => {
+        const key = req.headers['x-fsone-key'];
+        if (!key || typeof key !== 'string' || !key.startsWith('fso_')) {
+            throw new AppError('Missing or malformed X-FSOne-Key header', 401);
+        }
+
+        const integration = await Integration
+            .findOne({inboundKeyHash: Integration.hashInboundKey(key)})
+            .select('+inboundKeyHash +signingSecret');
+
+        if (!integration) {
+            logger.warn('Inbound integration request with unknown key', {ip: req.ip});
+            throw new AppError('Invalid inbound API key', 401);
+        }
+        if (integration.status !== INTEGRATION_STATUSES.VERIFIED) {
+            throw new AppError('Integration is not verified or has been disabled', 403);
+        }
+
+        const owner = await User.findById(integration.owner);
+        if (!owner || owner.active === false) {
+            throw new AppError('Integration owner account is not active', 403);
+        }
+
+        req.integration = integration;
+        req.integrationOwner = owner;
+        next();
+    }),
+
+    /**
+     * @desc    Fetch a granted file (metadata, optionally content) as an
+     *          external app. Response is HMAC-signed with the integration's
+     *          signing secret (X-FSOne-Signature over `${timestamp}.${body}`).
+     * @route   GET /api/v1/integrations/external/files?path=/x/y.txt&content=true
+     * @access  External (inbound API key)
+     */
+    externalGetFile: asyncHandler(async (req, res) => {
+        const integration = req.integration;
+        const owner = req.integrationOwner;
+        const filePath = String(req.query.path || '');
+        const wantContent = req.query.content === 'true';
+
+        const recordInbound = async (denied) => {
+            integration.inboundStats.totalRequests += 1;
+            if (denied) integration.inboundStats.deniedRequests += 1;
+            integration.inboundStats.lastRequestAt = new Date();
+            try { await integration.save(); } catch { /* stats are best-effort */ }
+        };
+
+        if (!integration.grantsPath(filePath)) {
+            await recordInbound(true);
+            throw new AppError('Path is not covered by this integration\'s grants', 403);
+        }
+
+        // Access is the intersection of the grant and the owner's own rights
+        const file = await File.findOneWithReadPermission(
+            {filePath, type: {$ne: 'directory'}},
+            owner._id.toString(),
+            owner.roles || []
+        );
+        if (!file) {
+            await recordInbound(true);
+            throw new AppError('File not found or not accessible', 404);
+        }
+
+        const response = {
+            success: true,
+            integration: {id: integration.id, name: integration.name},
+            file: {
+                fileName: file.fileName,
+                filePath: file.filePath,
+                fileType: file.type,
+                mimeType: file.mimeType,
+                size: file.size,
+                tags: file.tags || [],
+                description: file.description || '',
+                createdAt: file.createdAt,
+                updatedAt: file.updatedAt
+            }
+        };
+
+        if (wantContent) {
+            if (file.size > maxContentBytes()) {
+                await recordInbound(true);
+                throw new AppError(`File exceeds the maximum external transfer size of ${maxContentBytes()} bytes`, 413);
+            }
+            let content;
+            let encoding;
+            if (file.type === 'text') {
+                content = file.filePath ? await yjsService.getTextContent(file.filePath) : '';
+                encoding = 'utf-8';
+            } else {
+                content = await file.getContent(); // base64
+                encoding = 'base64';
+            }
+            response.file.content = content;
+            response.file.contentEncoding = encoding;
+            response.file.checksum = contentChecksum(content || '');
+            response.file.checksumAlgorithm = 'sha256';
+        }
+
+        await recordInbound(false);
+
+        const body = JSON.stringify(response);
+        const timestamp = Date.now().toString();
+        res.set('X-FSOne-Timestamp', timestamp);
+        res.set('X-FSOne-Signature', signPayload(integration.signingSecret, timestamp, body));
+        res.status(200).type('application/json').send(body);
     })
 };
 
