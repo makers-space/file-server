@@ -1737,6 +1737,9 @@ class FileNotificationService {
                 affectedUsers = Array.from(userSet);
             }
 
+            if (eventData.userId) affectedUsers = [...affectedUsers, eventData.userId];
+            affectedUsers = [...new Set(affectedUsers.map(String))];
+
             // Create notification payload
             const notification = {
                 type: eventType,

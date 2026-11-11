@@ -505,6 +505,62 @@ const getUserId = (req) => {
  * @returns {string} - Decoded file path
  * @throws {AppError} - If path is invalid or not encoded
  */
+const resolveAvailablePath = async (filePath, isDirectory = false) => {
+    if (!(await File.exists({filePath}))) return filePath;
+    const dir = path.posix.dirname(filePath);
+    const base = path.posix.basename(filePath);
+    const dot = isDirectory ? -1 : base.lastIndexOf('.');
+    const stem = dot > 0 ? base.slice(0, dot) : base;
+    const ext = dot > 0 ? base.slice(dot) : '';
+    for (let n = 1; n <= 999; n++) {
+        const candidate = path.posix.join(dir, `${stem} (${n})${ext}`);
+        if (!(await File.exists({filePath: candidate}))) return candidate;
+    }
+    throw new AppError('Too many items with the same name in this folder', 409);
+};
+
+// Resolves a name collision at requestedPath according to onConflict:
+// 'rename' keeps both under a numbered name, 'replace' removes the existing
+// file, anything else answers 409 NAME_CONFLICT and returns null.
+const settleNameConflict = async (res, requestedPath, options = {}) => {
+    const {onConflict, isDirectory = false, where = 'this folder', sourcePath, userId, userRoles} = options;
+    const existing = await File.findOne({filePath: requestedPath});
+    if (!existing) return requestedPath;
+
+    const canReplace = existing.type !== 'directory' && requestedPath !== sourcePath;
+    if (onConflict === 'replace') {
+        if (!canReplace) {
+            throw new AppError(existing.type === 'directory' ? 'A folder cannot be replaced' : 'An item cannot replace itself', 400);
+        }
+        const writable = await File.findOneWithWritePermission({filePath: requestedPath}, userId, userRoles);
+        if (!writable) {
+            throw new AppError('You do not have permission to replace the existing file', 403);
+        }
+        await writable.deleteOne();
+        if (writable.type === 'text') {
+            await yjsService.deleteDocument(requestedPath);
+        }
+        await cache.invalidateAllRelatedCaches('file', requestedPath, userId);
+        return requestedPath;
+    }
+
+    const suggestedPath = await resolveAvailablePath(requestedPath, isDirectory);
+    if (onConflict === 'rename') return suggestedPath;
+
+    res.status(409).json({
+        success: false,
+        code: 'NAME_CONFLICT',
+        message: `"${path.posix.basename(requestedPath)}" already exists in ${where}`,
+        conflict: {
+            destinationPath: requestedPath,
+            suggestedPath,
+            suggestedName: path.posix.basename(suggestedPath),
+            canReplace
+        }
+    });
+    return null;
+};
+
 const decodeFilePath = (encodedPath) => {
     try {
         // Validate input
@@ -1222,6 +1278,18 @@ const fileController = {
         const totalVersions = updatedFile.versionHistory.length;
         const versionNumber = totalVersions;
 
+        notificationService.broadcastFileEvent(
+            FILE_EVENTS.VERSION_SAVED,
+            {
+                filePath: decodedFilePath,
+                fileName: updatedFile.fileName,
+                versionNumber,
+                userId,
+                actor: req.user?.username
+            },
+            decodedFilePath
+        );
+
         res.status(201).json({
             success: true,
             operation: 'saveVersion',
@@ -1410,21 +1478,19 @@ const fileController = {
      * @access  Private (requires authentication)
      */
     createFile: asyncHandler(async (req, res) => {
-        const {filePath, content = '', description = '', overwrite = false} = req.body;
+        const {filePath, content = '', description = '', overwrite = false, onConflict = 'fail'} = req.body;
         if (!filePath) {
             throw new AppError('filePath is required', 400);
         }
 
-        const normalizedPath = path.posix.normalize(decodeFilePath(filePath));
+        let normalizedPath = path.posix.normalize(decodeFilePath(filePath));
         const userId = getUserId(req);
         const userRoles = req.user?.roles || [];
 
-        if (!overwrite) {
-            const existing = await File.findOne({filePath: normalizedPath});
-            if (existing) {
-                throw new AppError('File already exists. Set overwrite=true to replace it.', 409);
-            }
-        }
+        normalizedPath = await settleNameConflict(res, normalizedPath, {
+            onConflict: overwrite ? 'replace' : onConflict, userId, userRoles
+        });
+        if (!normalizedPath) return;
 
         const parentPath = path.posix.dirname(normalizedPath);
         if (parentPath === '/') {
@@ -1467,6 +1533,18 @@ const fileController = {
         await cache.invalidateAllRelatedCaches('file', normalizedPath, userId);
         await applyGroupMemberPermissions(normalizedPath).catch(() => {});
 
+        notificationService.broadcastFileEvent(
+            FILE_EVENTS.FILE_CREATED,
+            {
+                filePath: normalizedPath,
+                fileName: newFile.fileName,
+                fileType: newFile.type,
+                userId,
+                actor: req.user?.username
+            },
+            normalizedPath
+        );
+
         res.status(201).json({
             success: true,
             operation: 'create',
@@ -1486,22 +1564,22 @@ const fileController = {
      * @access  Private (requires authentication)
      */
     createDirectory: asyncHandler(async (req, res) => {
-        const {dirPath, description = ''} = req.body;
+        const {dirPath, description = '', onConflict = 'fail'} = req.body;
         if (!dirPath) {
             throw new AppError('dirPath is required', 400);
         }
 
         const decodedDirPath = decodeFilePath(dirPath);
-        const normalizedDirPath = path.posix.normalize(
+        let normalizedDirPath = path.posix.normalize(
             decodedDirPath.replace(/\/$/, '') || '/'
         );
         const userId = getUserId(req);
         const userRoles = req.user?.roles || [];
 
-        const existing = await File.findOne({filePath: normalizedDirPath, type: 'directory'});
-        if (existing) {
-            throw new AppError('Directory already exists.', 409);
-        }
+        normalizedDirPath = await settleNameConflict(res, normalizedDirPath, {
+            onConflict, isDirectory: true, userId, userRoles
+        });
+        if (!normalizedDirPath) return;
 
         const createDirParentPath = path.posix.dirname(normalizedDirPath);
         if (createDirParentPath === '/') {
@@ -1536,6 +1614,18 @@ const fileController = {
 
         await cache.invalidateAllRelatedCaches('file', normalizedDirPath, userId);
         await applyGroupMemberPermissions(normalizedDirPath).catch(() => {});
+
+        notificationService.broadcastFileEvent(
+            FILE_EVENTS.DIRECTORY_CREATED,
+            {
+                filePath: normalizedDirPath,
+                fileName: newDir.fileName,
+                fileType: newDir.type,
+                userId,
+                actor: req.user?.username
+            },
+            normalizedDirPath
+        );
 
         res.status(201).json({
             success: true,
@@ -1641,7 +1731,8 @@ const fileController = {
                 filePath: decodedFilePath,
                 fileName: deleteFile.fileName,
                 fileType: deleteFile.type,
-                userId
+                userId,
+                actor: req.user?.username
             },
             affectedUsersDelete
         );
@@ -1661,13 +1752,14 @@ const fileController = {
      * @access  Private (requires write permission)
      */
     moveFile: asyncHandler(async (req, res) => {
-        const {sourcePath, destinationPath} = req.body;
+        const {sourcePath, destinationPath, onConflict = 'fail'} = req.body;
         if (!sourcePath || !destinationPath) {
             throw new AppError('sourcePath and destinationPath are required', 400);
         }
 
         const normalizedSource = decodeFilePath(sourcePath);
-        const normalizedDestination = decodeFilePath(destinationPath);
+        const requestedDestination = decodeFilePath(destinationPath);
+        let normalizedDestination = requestedDestination;
         const userId = getUserId(req);
         const userRoles = req.user?.roles || [];
 
@@ -1679,6 +1771,19 @@ const fileController = {
         if (!moveFile) {
             throw new AppError('Source file not found or insufficient permissions', 404);
         }
+
+        const moveName = path.posix.basename(normalizedDestination);
+        if (normalizedSource === normalizedDestination) {
+            throw new AppError(`"${moveName}" is already in that folder`, 409);
+        }
+        if (normalizedDestination.startsWith(normalizedSource + '/')) {
+            throw new AppError('Cannot move a folder into itself', 400);
+        }
+        normalizedDestination = await settleNameConflict(res, normalizedDestination, {
+            onConflict, isDirectory: moveFile.type === 'directory', where: 'the destination folder',
+            sourcePath: normalizedSource, userId, userRoles
+        });
+        if (!normalizedDestination) return;
 
         const moveDestParentPath = path.posix.dirname(normalizedDestination);
         const moveDestParentWritable = await File.findOneWithWritePermission(
@@ -1713,6 +1818,7 @@ const fileController = {
         }
 
         moveFile.filePath = normalizedDestination;
+        moveFile.fileName = path.posix.basename(normalizedDestination);
         moveFile.owner = moveOwnerId;
         moveFile.lastModifiedBy = userId;
         if (String(moveOwnerId) !== String(userId)) {
@@ -1778,7 +1884,9 @@ const fileController = {
                 newFilePath: normalizedDestination,
                 fileName: moveFile.fileName,
                 fileType: moveFile.type,
-                userId
+                renamed: normalizedDestination !== requestedDestination,
+                userId,
+                actor: req.user?.username
             },
             affectedUsersMove
         );
@@ -1789,6 +1897,8 @@ const fileController = {
             message: 'File moved successfully',
             oldPath: normalizedSource,
             newPath: normalizedDestination,
+            fileName: moveFile.fileName,
+            renamed: normalizedDestination !== requestedDestination,
             timestamp: new Date().toISOString()
         });
     }),
@@ -1799,13 +1909,13 @@ const fileController = {
      * @access  Private (requires read permission on source)
      */
     copyFile: asyncHandler(async (req, res) => {
-        const {sourcePath, destinationPath} = req.body;
+        const {sourcePath, destinationPath, onConflict = 'fail'} = req.body;
         if (!sourcePath || !destinationPath) {
             throw new AppError('sourcePath and destinationPath are required', 400);
         }
 
         const normalizedSource = decodeFilePath(sourcePath);
-        const normalizedDestination = decodeFilePath(destinationPath);
+        const requestedDestination = decodeFilePath(destinationPath);
         const userId = getUserId(req);
         const userRoles = req.user?.roles || [];
 
@@ -1817,6 +1927,12 @@ const fileController = {
         if (!copyFile) {
             throw new AppError('Source file not found or insufficient permissions', 404);
         }
+
+        const normalizedDestination = await settleNameConflict(res, requestedDestination, {
+            onConflict, isDirectory: copyFile.type === 'directory', where: 'the destination folder',
+            sourcePath: normalizedSource, userId, userRoles
+        });
+        if (!normalizedDestination) return;
 
         const copyDestParentPath = path.posix.dirname(normalizedDestination);
         const copyDestParentWritable = await File.findOneWithWritePermission(
@@ -1886,7 +2002,10 @@ const fileController = {
                 filePath: normalizedDestination,
                 fileName: copiedFile.fileName,
                 fileType: copiedFile.type,
-                userId
+                operation: 'copy',
+                renamed: normalizedDestination !== requestedDestination,
+                userId,
+                actor: req.user?.username
             },
             affectedUsersCopy
         );
@@ -1897,6 +2016,8 @@ const fileController = {
             message: 'File copied successfully',
             oldPath: normalizedSource,
             newPath: normalizedDestination,
+            fileName: copiedFile.fileName,
+            renamed: normalizedDestination !== requestedDestination,
             timestamp: new Date().toISOString()
         });
     }),
@@ -1954,15 +2075,14 @@ const fileController = {
         }
 
         const parentPath = decodedFilePath.substring(0, decodedFilePath.lastIndexOf('/')) || '/';
-        const renamedFilePath = parentPath === '/' ? `/${finalFileName}` : `${parentPath}/${finalFileName}`;
+        let renamedFilePath = parentPath === '/' ? `/${finalFileName}` : `${parentPath}/${finalFileName}`;
 
-        const existingFile = await File.findOne({
-            filePath: renamedFilePath,
-            owner: userId
+        renamedFilePath = await settleNameConflict(res, renamedFilePath, {
+            onConflict: req.body.onConflict, isDirectory: renameFile.type === 'directory',
+            sourcePath: decodedFilePath, userId, userRoles
         });
-        if (existingFile) {
-            throw new AppError('A file with that name already exists', 409);
-        }
+        if (!renamedFilePath) return;
+        finalFileName = path.posix.basename(renamedFilePath);
 
         if (renameFile.type === 'binary' && renameFile.gridFSId) {
             try {
@@ -2027,7 +2147,8 @@ const fileController = {
                 oldFileName: newName,
                 newFileName: finalFileName,
                 fileType: renameFile.type,
-                userId
+                userId,
+                actor: req.user?.username
             },
             affectedUsersRename
         );
@@ -3281,6 +3402,8 @@ const fileController = {
                         FILE_EVENTS.FILE_SHARED,
                         {
                             sharedBy: userId,
+                            userId,
+                            actor: req.user?.username,
                             sharedWith: userIdsArray,
                             permission,
                             fileName: file.fileName,
@@ -3383,6 +3506,7 @@ const fileController = {
                         FILE_EVENTS.FILE_UNSHARED,
                         {
                             unsharedBy: userId,
+                            actor: req.user?.username,
                             unsharedFrom: userIdsArray,
                             permission,
                             fileName: file.fileName,
@@ -3433,6 +3557,7 @@ const fileController = {
                         FILE_EVENTS.FILE_UNSHARED,
                         {
                             unsharedBy: userId,
+                            actor: req.user?.username,
                             unsharedFrom: userIdsArray,
                             permission,
                             fileName: file.fileName,
@@ -3565,7 +3690,8 @@ const fileController = {
             tags = [],
             permissions = {},
             basePath,
-            overwrite = false
+            overwrite = false,
+            onConflict = 'fail'
         } = req.body;
 
         // Normalise to eliminate any .. traversal. Permission guards below gate access.
@@ -3629,6 +3755,9 @@ const fileController = {
         // Process files
         const uploadedFiles = [];
         const errors = [];
+        const renamed = [];
+        const conflicts = [];
+        const shouldOverwrite = overwrite === true || overwrite === 'true' || onConflict === 'replace';
 
         for (let i = 0; i < req.files.length; i++) {
             const uploadedFile = req.files[i];
@@ -3636,25 +3765,34 @@ const fileController = {
                 // Use explicit relative path from client if available (preserves folder structure)
                 const rawRelativePath = parsedRelativePaths?.[i] || uploadedFile.originalname;
                 const normalizedFilename = rawRelativePath.normalize('NFC');
-                const fileName = path.posix.basename(normalizedFilename);
-                const filePath = path.posix.join(effectiveBasePath, normalizedFilename);
+                let fileName = path.posix.basename(normalizedFilename);
+                let filePath = path.posix.join(effectiveBasePath, normalizedFilename);
                 const fileType = File.getFileType(fileName);
 
                 // Check if file already exists (filePath is globally unique)
-                const existingFile = await File.findOne({
+                let existingFile = await File.findOne({
                     filePath
                 });
 
-                if (existingFile && !overwrite) {
-                    errors.push({
-                        fileName: uploadedFile.originalname,
-                        error: 'File already exists'
-                    });
-                    continue;
+                if (existingFile && !shouldOverwrite) {
+                    const availablePath = await resolveAvailablePath(filePath);
+                    if (onConflict !== 'rename') {
+                        conflicts.push({
+                            fileName: uploadedFile.originalname,
+                            filePath,
+                            suggestedName: path.posix.basename(availablePath),
+                            canReplace: existingFile.type !== 'directory'
+                        });
+                        continue;
+                    }
+                    filePath = availablePath;
+                    fileName = path.posix.basename(filePath);
+                    renamed.push({ fileName: uploadedFile.originalname, savedAs: fileName, filePath });
+                    existingFile = null;
                 }
 
                 let file;
-                if (existingFile && overwrite) {
+                if (existingFile) {
                     // Update existing file based on type
                     if (existingFile.type === 'text') {
                         const ext = normalizedFilename.toLowerCase().split('.').pop();
@@ -3816,6 +3954,26 @@ const fileController = {
                 timestamp: new Date().toISOString()
             }
         };
+        if (renamed.length > 0) {
+            response.renamed = renamed;
+        }
+        if (conflicts.length > 0) {
+            response.conflicts = conflicts;
+        }
+        if (uploadedFiles.length > 0) {
+            notificationService.broadcastFileEvent(
+                FILE_EVENTS.FILE_UPLOADED,
+                {
+                    filePath: uploadedFiles[0].filePath,
+                    fileName: uploadedFiles[0].fileName,
+                    count: uploadedFiles.length,
+                    renamed,
+                    userId,
+                    actor: req.user?.username
+                },
+                uploadedFiles[0].filePath
+            );
+        }
 
         // Include errors in message if any files failed
         if (errors.length > 0) {

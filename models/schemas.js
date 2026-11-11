@@ -445,7 +445,8 @@ export const fileSchemas = {
         permissions: Joi.object({
             read: Joi.array().items(Joi.objectId()),
             write: Joi.array().items(Joi.objectId())
-        })
+        }),
+        onConflict: Joi.string().valid('fail', 'rename', 'replace').default('fail')
     }),
 
     getFileById: Joi.object({
@@ -526,12 +527,13 @@ export const fileSchemas = {
     }),
 
     createDirectory: Joi.object({
-        dirPath: Joi.string().pattern(/^\/([a-zA-Z0-9._/-]+)?$/).required()
+        dirPath: Joi.string().pattern(/^\/([a-zA-Z0-9._/ ()-]+)?$/).required()
             .messages({
                 'string.pattern.base': 'Directory path must be a valid filesystem path starting with /',
                 'any.required': 'Directory path is required'
             }),
-        description: Joi.string().max(500).allow('')
+        description: Joi.string().max(500).allow(''),
+        onConflict: Joi.string().valid('fail', 'rename', 'replace').default('fail')
     }),
 
     getDirectoryTree: Joi.object({
@@ -562,7 +564,8 @@ export const fileSchemas = {
         destinationPath: Joi.filePath().required()
             .messages({
                 'any.required': 'Destination path is required'
-            })
+            }),
+        onConflict: Joi.string().valid('fail', 'rename', 'replace').default('fail')
     }),
 
     copyFile: Joi.object({
@@ -574,7 +577,8 @@ export const fileSchemas = {
             .messages({
                 'any.required': 'Destination path is required'
             }),
-        includeVersionHistory: Joi.boolean().default(false)
+        includeVersionHistory: Joi.boolean().default(false),
+        onConflict: Joi.string().valid('fail', 'rename', 'replace').default('fail')
     }),
 
     renameFile: Joi.object({
@@ -587,7 +591,8 @@ export const fileSchemas = {
                 'string.max': 'New name cannot exceed 255 characters',
                 'string.pattern.base': 'New name contains invalid characters',
                 'any.required': 'New name is required'
-            })
+            }),
+        onConflict: Joi.string().valid('fail', 'rename', 'replace').default('fail')
     }),
 
     bulkOperations: Joi.object({
