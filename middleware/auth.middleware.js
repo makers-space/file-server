@@ -1,6 +1,7 @@
 import jwt from 'jsonwebtoken';
 import crypto from 'node:crypto';
 import {hasRight, hasRole, ROLES, RIGHTS} from '../config/rights.js';
+import {buildCookieOptions} from '../config/cookies.js';
 import {normalizeRoles} from './user.middleware.js';
 import {cache} from './cache.middleware.js';
 import logger from '../utils/app.logger.js';
@@ -73,12 +74,7 @@ const parseExpiryToMs = (str) => parseExpiryToSeconds(str) * 1000;
  * and more secure than 'none', which is only needed for cross-site contexts
  * (different eTLD+1, e.g. app.foo.com → api.bar.com).
  */
-const TOKEN_COOKIE_OPTIONS = {
-    httpOnly: true,
-    secure: process.env.NODE_ENV === 'production',
-    sameSite: 'lax',
-    path: '/'
-};
+const TOKEN_COOKIE_OPTIONS = buildCookieOptions();
 
 // Token lifetimes from env – single source of truth for TTL defaults below.
 const REFRESH_TOKEN_EXPIRY_S = parseExpiryToSeconds(process.env.REFRESH_TOKEN_EXPIRY);
