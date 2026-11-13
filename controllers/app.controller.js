@@ -2804,6 +2804,49 @@ const getPublicThemes = asyncHandler(async (req, res) => {
  * @route   GET /api/v1/themes
  * @access  Authenticated
  */
+const NOTIFICATION_LIST_LIMIT = 50;
+
+const getNotifications = asyncHandler(async (req, res) => {
+    const { default: Notification, NOTIFICATION_SERVICE } = await import('../models/notification.model.js');
+    const filter = { service: NOTIFICATION_SERVICE, user: req.user.id };
+    const [notifications, unread] = await Promise.all([
+        Notification.find(filter).sort({ createdAt: -1 }).limit(NOTIFICATION_LIST_LIMIT),
+        Notification.countDocuments({ ...filter, read: false })
+    ]);
+    res.status(200).json({
+        success: true,
+        unread,
+        notifications: notifications.map((entry) => ({
+            id: entry.id, type: entry.type, level: entry.level, title: entry.title, message: entry.message, path: entry.path, read: entry.read, createdAt: entry.createdAt
+        }))
+    });
+});
+
+// One notice when an id is given, otherwise all of this person's notices
+const notificationFilter = async (req, id) => {
+    const { default: Notification, NOTIFICATION_SERVICE } = await import('../models/notification.model.js');
+    const filter = { service: NOTIFICATION_SERVICE, user: req.user.id };
+    if (id !== undefined && id !== null && id !== '') {
+        if (!mongoose.isValidObjectId(id)) return { Notification, filter: null };
+        filter._id = id;
+    }
+    return { Notification, filter, all: { service: NOTIFICATION_SERVICE, user: req.user.id } };
+};
+
+const markNotificationsRead = asyncHandler(async (req, res) => {
+    const { Notification, filter, all } = await notificationFilter(req, req.body?.id);
+    if (!filter) return res.status(400).json({ success: false, message: 'Invalid notification id' });
+    await Notification.updateMany({ ...filter, read: false }, { read: true });
+    res.status(200).json({ success: true, unread: await Notification.countDocuments({ ...all, read: false }) });
+});
+
+const clearNotifications = asyncHandler(async (req, res) => {
+    const { Notification, filter } = await notificationFilter(req, req.query?.id);
+    if (!filter) return res.status(400).json({ success: false, message: 'Invalid notification id' });
+    const result = await Notification.deleteMany(filter);
+    res.status(200).json({ success: true, removed: result.deletedCount });
+});
+
 const getMyThemes = asyncHandler(async (req, res) => {
     const themes = await Theme.find({owner: req.user.id}).sort({updatedAt: -1});
     res.status(200).json({
@@ -2990,6 +3033,9 @@ export {
     getPresets,
     getPublicThemes,
     getMyThemes,
+    getNotifications,
+    markNotificationsRead,
+    clearNotifications,
     getThemeById,
     createTheme,
     updateTheme,

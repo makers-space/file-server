@@ -1748,6 +1748,7 @@ class FileNotificationService {
 
             // Send to all affected users
             const sentCount = this.sendToUsers(affectedUsers, notification);
+            this.keepForOthers(affectedUsers, eventType, eventData);
             
             logger.info('📢 File event broadcasted', {
                 eventType,
@@ -1761,6 +1762,35 @@ class FileNotificationService {
         } catch (error) {
             logger.error('Error broadcasting file event:', error);
             return 0;
+        }
+    }
+
+    /**
+     * Keep a readable copy of the event for everyone except the person who did it,
+     * so they can find it later on their dashboard.
+     */
+    async keepForOthers(userIds, eventType, data = {}) {
+        const verbs = {
+            'file:created': 'created', 'directory:created': 'created the folder', 'file:uploaded': 'uploaded', 'file:deleted': 'deleted',
+            'file:renamed': 'renamed a file to', 'file:moved': 'moved', 'file:shared': 'shared', 'file:unshared': 'changed sharing on',
+            'version:saved': 'saved a version of'
+        };
+        const name = data.newFileName || data.fileName;
+        const actorId = String(data.userId || data.sharedBy || data.unsharedBy || '');
+        const others = userIds.map(String).filter((userId) => userId !== actorId);
+        if (!verbs[eventType] || !name || others.length === 0) return;
+        try {
+            const { default: Notification } = await import('../models/notification.model.js');
+            await Notification.insertMany(others.map((user) => ({
+                user,
+                type: eventType,
+                level: 'info',
+                title: 'Activity',
+                message: `${data.actor || 'Someone'} ${verbs[eventType]} "${name}"`.slice(0, 500),
+                path: null
+            })), { ordered: false });
+        } catch (error) {
+            logger.warn('File notification could not be kept', { type: eventType, error: error.message });
         }
     }
 

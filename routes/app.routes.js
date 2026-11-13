@@ -11,6 +11,8 @@ const router = Router();
 // Define app routes for validation
 router.validRoutes = [
     '/api/v1/health',
+    '/api/v1/notifications',
+    '/api/v1/notifications/read',
     '/api/v1/logs',
     '/api/v1/logs/stats',
     '/api/v1/logs/:id',
@@ -131,6 +133,10 @@ router.get('/themes',
     authMiddleware.verifyToken(),
     appController.getMyThemes
 );
+
+router.get('/notifications', authMiddleware.verifyToken(), appController.getNotifications);
+router.post('/notifications/read', authMiddleware.verifyToken(), appController.markNotificationsRead);
+router.delete('/notifications', authMiddleware.verifyToken(), appController.clearNotifications);
 
 /**
  * Create Theme:
