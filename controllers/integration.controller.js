@@ -33,6 +33,7 @@ const yjsService = getYjsService();
 
 const DEFAULT_MAX_CONTENT_BYTES = 10 * 1024 * 1024; // 10MB
 const maxContentBytes = () => parseInt(process.env.EXTERNAL_SHARE_MAX_CONTENT_BYTES);
+const maxPullBytes = () => parseInt(process.env.EXTERNAL_PULL_MAX_CONTENT_BYTES);
 
 const getUserId = (req) => {
     const userId = req.user?.id || req.user?._id;
@@ -573,9 +574,9 @@ const integrationController = {
         };
 
         if (wantContent) {
-            if (file.size > maxContentBytes()) {
+            if (file.size > maxPullBytes()) {
                 await recordInbound(true);
-                throw new AppError(`File exceeds the maximum external transfer size of ${maxContentBytes()} bytes`, 413);
+                throw new AppError(`File exceeds the maximum external pull size of ${maxPullBytes()} bytes`, 413);
             }
             let content;
             let encoding;

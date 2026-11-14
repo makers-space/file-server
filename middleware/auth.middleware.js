@@ -201,6 +201,10 @@ const hashToken = (token) => {
  * @returns {Promise<object>} Decoded user with normalized roles
  * @throws {{ status: number, message: string }} on any auth failure
  */
+const ADMIN_ONLY_MESSAGE = 'This environment is limited to administrators';
+const adminOnly = () => process.env.ADMIN_ONLY === 'true';
+const adminOnlyBlocks = (roles) => adminOnly() && !hasRole(normalizeRoles(roles), ROLES.ADMIN);
+
 const validateToken = async (token, tokenType = 'access') => {
     if (!token) {
         throw { status: 401, message: 'Unauthorized: Authentication required' };
@@ -248,6 +252,9 @@ const validateToken = async (token, tokenType = 'access') => {
     }
     if (user.changedPasswordAfter && user.changedPasswordAfter(decoded.iat)) {
         throw { status: 401, message: 'Password changed. Please log in again.' };
+    }
+    if (adminOnlyBlocks(user.roles)) {
+        throw { status: 403, message: ADMIN_ONLY_MESSAGE };
     }
 
     return { ...decoded, roles: normalizeRoles(decoded.roles) };
@@ -408,7 +415,7 @@ const optionalAuth = (options = {}) => {
 
                 // Find user and check status
                 const user = await User.findById(decoded.id).select('+active');
-                if (!user || !user.active) {
+                if (!user || !user.active || adminOnlyBlocks(user.roles)) {
                     req.user = null;
                     return next();
                 }
@@ -503,6 +510,9 @@ const authenticateWebSocket = async (ws, req) => {
 
 export {
     verifyToken,
+    adminOnly,
+    adminOnlyBlocks,
+    ADMIN_ONLY_MESSAGE,
     checkRole,
     checkPermission,
     optionalAuth,

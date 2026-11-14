@@ -131,6 +131,7 @@ class Server {
             'EMAIL_PASS',
             'EMAIL_PORT',
             'EMAIL_USER',
+            'EXTERNAL_PULL_MAX_CONTENT_BYTES',
             'EXTERNAL_SHARE_MAX_CONTENT_BYTES',
             'EXTERNAL_SHARE_TIMEOUT_MS',
             'LOG_LEVEL',
