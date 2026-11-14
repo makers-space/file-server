@@ -571,17 +571,15 @@ const authController = {
 
                 // Send security alert email if this is a new device (but not during signup)
                 if (isNewDevice) {
-                    try {
-                        await sendNewDeviceLoginEmail(user, deviceInfo, getEmailTransporter());
-                        logger.info('[Auth Controller - Login] New device login email sent:', {
+                    // Sent in the background, so a slow or unreachable mail server cannot hold up sign-in
+                    Promise.resolve()
+                        .then(() => sendNewDeviceLoginEmail(user, deviceInfo, getEmailTransporter()))
+                        .then(() => logger.info('[Auth Controller - Login] New device login email sent:', {
                             userId: user.id, deviceId: deviceInfo.deviceId, email: user.email
-                        });
-                    } catch (emailError) {
-                        logger.warn('[Auth Controller - Login] Failed to send new device login email:', {
+                        }))
+                        .catch((emailError) => logger.warn('[Auth Controller - Login] Failed to send new device login email:', {
                             message: emailError.message, userId: user.id, email: user.email
-                        });
-                        // Don't fail login if email fails
-                    }
+                        }));
                 }
 
                 await addOrUpdateDevice(user, deviceInfo);
