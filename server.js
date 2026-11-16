@@ -23,7 +23,7 @@ const {default: errorHandler} = await import('./middleware/error.middleware.js')
 const appMiddleware = await import('./middleware/app.middleware.js');
 const appController = await import('./controllers/app.controller.js');
 
-const {noCacheResponse} = await import('./middleware/cache.middleware.js');
+const {noCacheResponse, invalidateEntityCache} = await import('./middleware/cache.middleware.js');
 
 const {cleanupService} = await import('./controllers/cache.controller.js');
 
@@ -38,6 +38,9 @@ const {
 const notificationService = getFileNotificationService();
 
 const {redisClient} = appMiddleware;
+
+// How often an open file's access is checked again. Optional; three seconds unless set.
+const YJS_ACCESS_CHECK_MS = parseInt(process.env.YJS_ACCESS_CHECK_MS, 10) || 3000;
 
 /**
  * Server class that encapsulates the Express application
@@ -424,12 +427,14 @@ class Server {
                             // manual compaction race that used to live inline here.
                             const coordinator = new PersistenceCoordinator({
                                 persistence,
-                                touchFileMetadata: async (docName) => {
+                                // size is the stored text's length in bytes, so a file edited live reports its real size
+                                touchFileMetadata: async (docName, size) => {
                                     const filePath = filePathFromDocName(docName);
                                     await FileModel.updateOne(
                                         { filePath, type: { $in: ['text', 'binary'] } },
-                                        { updatedAt: new Date() }
+                                        { updatedAt: new Date(), ...(Number.isFinite(size) ? { size } : {}) }
                                     );
+                                    if (Number.isFinite(size)) await invalidateEntityCache('file', filePath);
                                 },
                             });
 
@@ -510,7 +515,8 @@ class Server {
                                         return;
                                     }
                                     // A person who may only read still follows the document live, but changes they send are dropped.
-                                    if (!file.hasWriteAccess(user.id)) {
+                                    const canWrite = file.hasWriteAccess(user.id);
+                                    if (!canWrite) {
                                         const listen = ws.on.bind(ws);
                                         ws.on = (event, handler) => listen(event, event !== 'message' ? handler : (data, ...rest) => {
                                             const bytes = new Uint8Array(data);
@@ -519,6 +525,21 @@ class Server {
                                         });
                                     }
                                     setupWSConnection(ws, req, { docName, gc: false });
+                                    // Access is checked again every few seconds while the file stays open. When it changes the
+                                    // connection is closed with a code the page understands, and the page reconnects under the new access.
+                                    const accessWatch = setInterval(async () => {
+                                        try {
+                                            const now = await FileModel.findOne({ filePath });
+                                            if (!now) return ws.close(4404, 'File not found');
+                                            if (!now.hasReadAccess(user.id)) return ws.close(4403, 'Access denied');
+                                            if (now.hasWriteAccess(user.id) !== canWrite) return ws.close(4405, 'Access changed');
+                                        } catch {
+                                            return undefined;
+                                        }
+                                        return undefined;
+                                    }, YJS_ACCESS_CHECK_MS);
+                                    accessWatch.unref?.();
+                                    ws.on('close', () => clearInterval(accessWatch));
                                     // Proactively push full doc state as messageYjsUpdate to this new conn.
                                     // bindState's update broadcast only reaches the FIRST conn that triggers
                                     // the load; subsequent conns can be left blank because the client/server

@@ -493,11 +493,13 @@ const makeDocState = () => ({
     dirty: false,              // anything happened since last metadata touch?
 });
 
+const STORED_STATE = Symbol('stored state');
+
 class PersistenceCoordinator {
     /**
      * @param {object} opts
      * @param {object} opts.persistence  - y-mongodb-provider MongodbPersistence instance
-     * @param {function} opts.touchFileMetadata - async (docName) => void
+     * @param {function} opts.touchFileMetadata - async (docName, sizeInBytes) => void
      * @param {function} [opts.onDocFlushed] - optional hook (docName, epoch) => void
      */
     constructor({ persistence, touchFileMetadata, onDocFlushed }) {
@@ -523,18 +525,22 @@ class PersistenceCoordinator {
      * installs the update listener that schedules batched writes.
      */
     async bindState(docName, ydoc) {
+        // Changes are watched from the start, so an edit that arrives while the stored state is still loading
+        // is counted as a change too. Applying the stored state itself is not a change.
+        ydoc.on('update', (update, origin) => {
+            if (origin !== STORED_STATE) this._enqueueUpdate(docName, ydoc, update);
+        });
+
         try {
             const persistedYdoc = await this.persistence.getYDoc(docName);
             const persistedUpdate = Y.encodeStateAsUpdate(persistedYdoc);
             if (persistedUpdate.length > 0) {
-                Y.applyUpdate(ydoc, persistedUpdate);
+                Y.applyUpdate(ydoc, persistedUpdate, STORED_STATE);
             }
             persistedYdoc.destroy();
         } catch (error) {
             logger.error('PersistenceCoordinator.bindState load failed', { docName, error: error.message });
         }
-
-        ydoc.on('update', (update) => this._enqueueUpdate(docName, ydoc, update));
     }
 
     _enqueueUpdate(docName, ydoc, update) {
@@ -548,6 +554,10 @@ class PersistenceCoordinator {
         state.flushTimer = setTimeout(() => this._flush(docName, ydoc).catch((err) => {
             logger.error('PersistenceCoordinator flush error', { docName, error: err.message });
         }), YJS_FLUSH_DELAY_MS);
+    }
+
+    _sizeOf(ydoc) {
+        return ydoc ? Buffer.byteLength(ydoc.getText('content').toString(), 'utf8') : undefined;
     }
 
     async _flush(docName, ydoc) {
@@ -574,7 +584,7 @@ class PersistenceCoordinator {
         if (state.dirty) {
             state.dirty = false;
             try {
-                await this.touchFileMetadata(docName);
+                await this.touchFileMetadata(docName, this._sizeOf(ydoc));
             } catch (error) {
                 logger.error('PersistenceCoordinator touchFileMetadata failed', { docName, error: error.message });
             }
@@ -605,7 +615,7 @@ class PersistenceCoordinator {
                 }
                 if (state.dirty) {
                     state.dirty = false;
-                    try { await this.touchFileMetadata(docName); } catch (e) {
+                    try { await this.touchFileMetadata(docName, this._sizeOf(ydoc)); } catch (e) {
                         logger.error('writeState touchFileMetadata failed', { docName, error: e.message });
                     }
                 }
@@ -653,7 +663,7 @@ class PersistenceCoordinator {
                 await this.persistence.storeUpdate(docName, update);
                 ydoc.destroy();
             }
-            try { await this.touchFileMetadata(docName); } catch (e) {
+            try { await this.touchFileMetadata(docName, Buffer.byteLength(content || '', 'utf8')); } catch (e) {
                 logger.error('replaceContent touchFileMetadata failed', { docName, error: e.message });
             }
         } catch (error) {
