@@ -116,6 +116,7 @@ const fileSchema = new mongoose.Schema({
         required: function() { return this.type !== 'directory'; },
         default: function() {
             if (this.type === 'directory') return undefined;
+            if (/\.flow$/i.test(this.fileName || '')) return 'text/plain';
             return mime.lookup(this.fileName) || 'application/octet-stream';
         }
     },
@@ -315,7 +316,7 @@ fileSchema.statics.getSupportedTypes = function() {
                         'sql', 'py', 'java', 'c', 'cpp', 'h', 'go', 'rs', 'php',
                         'rb', 'sh', 'bat', 'ps1', 'dockerfile', 'gitignore',
                         'ini', 'conf', 'config', 'env', 'log',
-                        'doc', 'docx'],
+                        'doc', 'docx', 'flow'],
             description: 'Text files stored as Yjs collaborative documents'
         },
         binary: {
@@ -342,6 +343,7 @@ fileSchema.statics.getMimeType = function(extension) {
         'xml': 'application/xml',
         'yaml': 'application/yaml',
         'yml': 'application/yaml',
+        'flow': 'text/plain',
         'doc': 'application/msword',
         'docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
         // Images - compressed formats

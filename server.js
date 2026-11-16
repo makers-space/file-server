@@ -509,6 +509,15 @@ class Server {
                                         ws.close(4403, 'Access denied');
                                         return;
                                     }
+                                    // A person who may only read still follows the document live, but changes they send are dropped.
+                                    if (!file.hasWriteAccess(user.id)) {
+                                        const listen = ws.on.bind(ws);
+                                        ws.on = (event, handler) => listen(event, event !== 'message' ? handler : (data, ...rest) => {
+                                            const bytes = new Uint8Array(data);
+                                            if (bytes[0] === 0 && bytes[1] !== 0) return;
+                                            handler(data, ...rest);
+                                        });
+                                    }
                                     setupWSConnection(ws, req, { docName, gc: false });
                                     // Proactively push full doc state as messageYjsUpdate to this new conn.
                                     // bindState's update broadcast only reaches the FIRST conn that triggers
