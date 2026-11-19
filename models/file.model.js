@@ -442,6 +442,14 @@ fileSchema.statics.getFileType = function(fileName) {
     return BINARY_FILE_EXTENSIONS.includes(ext) ? 'binary' : 'text';
 };
 
+// A text file is kept as a document people can edit together. One larger than this is kept as it is, like any other
+// file: it would take many times its size in memory to open for editing, and no editor could show it.
+export const LIVE_TEXT_BYTES = 10 * 1024 * 1024;
+fileSchema.statics.getStoredType = function(fileName, bytes) {
+    const type = this.getFileType(fileName);
+    return type === 'text' && bytes > LIVE_TEXT_BYTES && !/\.docx$/i.test(fileName || '') ? 'binary' : type;
+};
+
 // Instance method to get current content (binary files only - text files use Yjs)
 fileSchema.methods.getContent = async function() {
     if (this.type === 'text') {

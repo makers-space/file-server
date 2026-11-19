@@ -3767,7 +3767,7 @@ const fileController = {
                 const normalizedFilename = rawRelativePath.normalize('NFC');
                 let fileName = path.posix.basename(normalizedFilename);
                 let filePath = path.posix.join(effectiveBasePath, normalizedFilename);
-                const fileType = File.getFileType(fileName);
+                const fileType = File.getStoredType(fileName, uploadedFile.buffer.length);
 
                 // Check if file already exists (filePath is globally unique)
                 let existingFile = await File.findOne({
@@ -3793,6 +3793,11 @@ const fileController = {
 
                 let file;
                 if (existingFile) {
+                    // A text file replaced by one too large to edit together stops being a shared document.
+                    if (existingFile.type === 'text' && fileType === 'binary') {
+                        await yjsService.deleteDocument(filePath);
+                        existingFile.type = 'binary';
+                    }
                     // Update existing file based on type
                     if (existingFile.type === 'text') {
                         const ext = normalizedFilename.toLowerCase().split('.').pop();
@@ -4077,7 +4082,7 @@ const fileController = {
                     // Extract file
                     const buffer = await zipEntry.async('nodebuffer');
                     const fileName = path.posix.basename(entryPath);
-                    const fileType = File.getFileType(fileName);
+                    const fileType = File.getStoredType(fileName, buffer.length);
 
                     const extractOwnerId = await ensureParentDirs(entryPath, userId);
 
