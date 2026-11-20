@@ -482,7 +482,28 @@ const ensureParentDirs = async (filePath, userId) => {
     return ownerId;
 };
 
-const normalizeFilePath = (filePath = '') => 
+/**
+ * Refuses a write into a folder the user may not write to. A folder that does not exist yet is judged by the nearest
+ * folder above it that does; a new top-level folder may only be the user's own /<username>. Without this, writing into
+ * /<someone else>/<new folder> made the folders, owned by that person, and put the files in their account.
+ */
+const assertCanWriteInto = async (dirPath, req) => {
+    const userId = getUserId(req);
+    const userRoles = req.user?.roles || [];
+    const target = path.posix.normalize(dirPath || '/');
+    if (target === '/') throw new AppError('Cannot write directly at the filesystem root', 403);
+    for (let current = target; current !== '/'; current = path.posix.dirname(current)) {
+        if (await File.findOneWithWritePermission({ filePath: current, type: 'directory' }, userId, userRoles)) return;
+        if (await File.exists({ filePath: current })) {
+            throw new AppError('You do not have write permission in the destination directory', 403);
+        }
+    }
+    const top = target.split('/').filter(Boolean)[0];
+    if (top === req.user?.username || hasAdminContentAccess(userRoles)) return;
+    throw new AppError('Files can only be saved inside your own folder or a folder shared with you', 403);
+};
+
+const normalizeFilePath = (filePath = '') =>
     filePath ? (filePath.startsWith('/') ? filePath : `/${filePath}`) : '/';
 
 /**
@@ -1785,18 +1806,7 @@ const fileController = {
         });
         if (!normalizedDestination) return;
 
-        const moveDestParentPath = path.posix.dirname(normalizedDestination);
-        const moveDestParentWritable = await File.findOneWithWritePermission(
-            { filePath: moveDestParentPath, type: 'directory' },
-            userId,
-            userRoles
-        );
-        if (!moveDestParentWritable) {
-            const moveDestParentExists = await File.exists({ filePath: moveDestParentPath, type: 'directory' });
-            if (moveDestParentExists) {
-                throw new AppError('You do not have write permission in the destination directory', 403);
-            }
-        }
+        await assertCanWriteInto(path.posix.dirname(normalizedDestination), req);
 
         let yjsBeforeMove = null;
         if (moveFile.type === 'text') {
@@ -1934,18 +1944,7 @@ const fileController = {
         });
         if (!normalizedDestination) return;
 
-        const copyDestParentPath = path.posix.dirname(normalizedDestination);
-        const copyDestParentWritable = await File.findOneWithWritePermission(
-            { filePath: copyDestParentPath, type: 'directory' },
-            userId,
-            userRoles
-        );
-        if (!copyDestParentWritable) {
-            const copyDestParentExists = await File.exists({ filePath: copyDestParentPath, type: 'directory' });
-            if (copyDestParentExists) {
-                throw new AppError('You do not have write permission in the destination directory', 403);
-            }
-        }
+        await assertCanWriteInto(path.posix.dirname(normalizedDestination), req);
 
         const copyOwnerId = await ensureParentDirs(normalizedDestination, userId);
         const copyIsGuest = String(copyOwnerId) !== String(userId);
@@ -3697,25 +3696,10 @@ const fileController = {
         // Normalise to eliminate any .. traversal. Permission guards below gate access.
         const effectiveBasePath = path.posix.normalize(basePath || ('/' + req.user.username));
 
-        // Guard: the filesystem root '/' is never a valid upload destination.
-        // It has no MongoDB document so the write-permission check below would silently
-        // pass for it — block it explicitly before reaching that check.
         if (effectiveBasePath === '/') {
             throw new AppError('Cannot upload directly to the filesystem root', 403);
         }
-
-        // Guard: user must have write access to the upload destination.
-        const uploadDestWritable = await File.findOneWithWritePermission(
-            { filePath: effectiveBasePath, type: 'directory' },
-            userId, userRoles
-        );
-        if (!uploadDestWritable) {
-            const uploadDestExists = await File.exists({ filePath: effectiveBasePath, type: 'directory' });
-            if (uploadDestExists) {
-                throw new AppError('You do not have write permission in the upload destination', 403);
-            }
-            // Destination doesn't exist yet — ensureParentDirs will create it under this user.
-        }
+        await assertCanWriteInto(effectiveBasePath, req);
 
         // Standardized input parsing
         const parsedTags = Array.isArray(tags) ? tags : 
@@ -3767,12 +3751,18 @@ const fileController = {
                 const normalizedFilename = rawRelativePath.normalize('NFC');
                 let fileName = path.posix.basename(normalizedFilename);
                 let filePath = path.posix.join(effectiveBasePath, normalizedFilename);
+                if (!filePath.startsWith(effectiveBasePath + '/')) {
+                    throw new AppError('This file\'s path points outside the folder it is uploaded into', 400);
+                }
                 const fileType = File.getStoredType(fileName, uploadedFile.buffer.length);
 
                 // Check if file already exists (filePath is globally unique)
                 let existingFile = await File.findOne({
                     filePath
                 });
+                if (existingFile && shouldOverwrite && !(await File.findOneWithWritePermission({ filePath }, userId, userRoles))) {
+                    throw new AppError('You do not have write permission for this file', 403);
+                }
 
                 if (existingFile && !shouldOverwrite) {
                     const availablePath = await resolveAvailablePath(filePath);
@@ -4041,6 +4031,7 @@ const fileController = {
         const zipName = path.posix.basename(normalizedZipPath).replace(/\.zip$/i, '');
         const allZipEntries = Object.keys(zip.files).filter(p => !p.startsWith('__MACOSX/') && !p.includes('/.'));
         const effectiveTargetPath = path.posix.join(normalizedTargetPath, zipName);
+        await assertCanWriteInto(effectiveTargetPath, req);
 
         logger.info('Zip extraction starting', {
             userId,
@@ -4054,9 +4045,12 @@ const fileController = {
             // Skip macOS resource forks and hidden metadata
             if (relativePath.startsWith('__MACOSX/') || relativePath.includes('/.')) continue;
 
-            const entryPath = path.posix.join(effectiveTargetPath, relativePath);
+            const entryPath = path.posix.join(effectiveTargetPath, relativePath).replace(/\/+$/, '');
 
             try {
+                if (!entryPath.startsWith(effectiveTargetPath + '/') && entryPath !== effectiveTargetPath) {
+                    throw new AppError('This entry points outside the folder it is extracted into', 400);
+                }
                 if (zipEntry.dir) {
                     // Create directory — ensureParentDirs resolves workspace owner
                     const zipDirOwnerId = await ensureParentDirs(entryPath + '/placeholder', userId);
@@ -4087,6 +4081,9 @@ const fileController = {
                     const extractOwnerId = await ensureParentDirs(entryPath, userId);
 
                     const existingFile = await File.findOne({ filePath: entryPath });
+                    if (existingFile && !(await File.findOneWithWritePermission({ filePath: entryPath }, userId, userRoles))) {
+                        throw new AppError('You do not have write permission for this file', 403);
+                    }
                     if (existingFile) {
                         // Overwrite existing file
                         if (existingFile.type === 'text') {
